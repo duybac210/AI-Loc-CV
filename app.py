@@ -31,7 +31,7 @@ from modules.database_manager import (
 )
 from modules.embedding_manager import encode, get_model
 from modules.export_manager import results_to_dataframe, to_csv_bytes, to_excel_bytes
-from modules.pdf_processor import extract_text_from_pdf
+from modules.pdf_processor import extract_text_from_pdf, OCR_PREFIX
 
 # ---------------------------------------------------------------------------
 # Page config & DB init
@@ -95,7 +95,7 @@ def render_sidebar():
             f"Kỹ năng {round(WEIGHT_SKILL*100)}%"
         )
         st.divider()
-        st.markdown("**📄 PDF hỗ trợ:** pdfplumber (primary) + PyPDF2 (fallback)")
+        st.markdown("**📄 PDF hỗ trợ:** pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract)")
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +159,7 @@ def render_analysis_tab():
         results = []
         progress = st.progress(0, text="Đang xử lý CV…")
         errors = []
+        ocr_files: list[str] = []
 
         for i, uploaded_file in enumerate(uploaded_files):
             cv_bytes = uploaded_file.read()
@@ -166,6 +167,9 @@ def render_analysis_tab():
 
             if cv_text.startswith("[PDF extraction failed"):
                 errors.append(uploaded_file.name)
+            elif cv_text.startswith(OCR_PREFIX):
+                ocr_files.append(uploaded_file.name)
+                cv_text = cv_text[len(OCR_PREFIX):]  # strip marker before analysis
 
             result = analyze_cv(
                 filename=uploaded_file.name,
@@ -190,6 +194,13 @@ def render_analysis_tab():
             f"⚠️ Không thể trích xuất text từ {len(errors)} file(s): "
             f"{', '.join(errors)}. "
             "File có thể là PDF scan hoặc bị mã hoá – điểm sẽ thấp bất thường."
+        )
+
+    if ocr_files:
+        st.info(
+            f"🔍 **OCR được dùng cho {len(ocr_files)} file(s):** {', '.join(ocr_files)}. "
+            "Đây là CV dạng ảnh/scan – text được nhận dạng tự động bằng Tesseract OCR. "
+            "Độ chính xác có thể thấp hơn CV dạng text thông thường."
         )
 
     st.success(f"✅ Đã lưu kết quả vào lịch sử (Session #{session_id})")
@@ -443,7 +454,7 @@ def render_about_tab():
 |---|---|
 | **AI Model** | `paraphrase-multilingual-MiniLM-L12-v2` (hỗ trợ 50+ ngôn ngữ) |
 | **Ngôn ngữ** | Tiếng Việt + Tiếng Anh (cross-lingual matching) |
-| **PDF Extraction** | pdfplumber (primary) → PyPDF2 (fallback) |
+| **PDF Extraction** | pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract vie+eng) |
 | **Cơ sở dữ liệu** | SQLite (lưu lịch sử tất cả phiên phân tích) |
 | **Scoring** | Composite = 65% Semantic + 35% Skill Coverage |
 
@@ -460,10 +471,17 @@ Composite Score = 0.65 × Semantic + 0.35 × Skill Coverage
 Model `paraphrase-multilingual-MiniLM-L12-v2` được train trên **50+ ngôn ngữ**, 
 cho phép so sánh cross-lingual: JD tiếng Việt ↔ CV tiếng Anh và ngược lại.
 
-### Lưu ý với PDF scan
+### Pipeline trích xuất PDF (4 tầng)
 
-PDF được tạo bằng cách **chụp ảnh/scan** (không phải copy-paste text) sẽ không thể
-trích xuất text. Khuyến nghị dùng CV dạng **text-based PDF** (tạo từ Word/Google Docs).
+| Bước | Thư viện | Xử lý tốt |
+|---|---|---|
+| 1 | **pdfplumber** | CV text thông thường, bảng biểu |
+| 2 | **PyMuPDF** | CV thiết kế (Canva, template đẹp), font đặc biệt |
+| 3 | **PyPDF2** | Fallback nhẹ |
+| 4 | **Tesseract OCR** | CV scan, ảnh chụp, PDF hình ảnh |
+
+> **Lưu ý:** Bước OCR cần cài `tesseract-ocr` và `poppler-utils` trên hệ thống.
+> Trên Ubuntu/Debian: `sudo apt install tesseract-ocr tesseract-ocr-vie poppler-utils`
 """
     )
 
