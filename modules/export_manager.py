@@ -6,10 +6,22 @@ for CSV and Excel export (Streamlit download buttons).
 from __future__ import annotations
 
 import io
+import re
 
 import pandas as pd
 
 from modules.cv_analyzer import CVResult
+
+# Matches characters that are illegal in Excel/openpyxl worksheets
+# (control chars except tab, newline, carriage-return)
+_ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _sanitize(value: object) -> object:
+    """Strip illegal Excel characters from string values."""
+    if isinstance(value, str):
+        return _ILLEGAL_CHARS_RE.sub("", value)
+    return value
 
 
 def results_to_dataframe(results: list[CVResult]) -> pd.DataFrame:
@@ -43,7 +55,9 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     """Return the DataFrame encoded as an Excel (.xlsx) file in memory."""
+    # Sanitize all string cells to remove characters illegal in Excel worksheets
+    clean_df = df.apply(lambda col: col.map(_sanitize))
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="CV Rankings")
+        clean_df.to_excel(writer, index=False, sheet_name="CV Rankings")
     return buffer.getvalue()
