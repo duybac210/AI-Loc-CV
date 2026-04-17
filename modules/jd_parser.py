@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from config import SKILL_KEYWORDS
+from config import SKILL_KEYWORDS, MAX_EXPERIENCE_YEARS
 
 
 @dataclass
@@ -171,7 +171,7 @@ def parse_jd(jd_text: str) -> JDSummary:
         for m in re.finditer(pat, jd_text, re.IGNORECASE):
             try:
                 y = int(m.group(1))
-                if 0 < y <= 40:
+                if 0 < y <= MAX_EXPERIENCE_YEARS:
                     summary.min_experience = max(summary.min_experience, y)
             except (ValueError, IndexError):
                 pass

@@ -22,6 +22,10 @@ from config import (
     WEIGHT_SEMANTIC,
     WEIGHT_SKILL,
     WEIGHT_EXPERIENCE,
+    MIN_CANDIDATES_FOR_INTERVIEW,
+    MIN_CANDIDATES_FOR_LOW_WARNING,
+    LOW_MATCH_PCT_THRESHOLD,
+    SKILL_GAP_WARNING_THRESHOLD,
 )
 from modules.cv_analyzer import CVResult, analyze_cv, extract_jd_skills, rank_results
 from modules.database_manager import (
@@ -340,9 +344,9 @@ def _render_insight_dashboard(
     suggestions: list[str] = []
 
     high_pct = high / total * 100 if total else 0
-    if high >= 5:
+    if high >= MIN_CANDIDATES_FOR_INTERVIEW:
         suggestions.append(
-            f"✅ Có **{high} ứng viên phù hợp cao** – nên mời phỏng vấn Top {min(high, 5)}."
+            f"✅ Có **{high} ứng viên phù hợp cao** – nên mời phỏng vấn Top {min(high, MIN_CANDIDATES_FOR_INTERVIEW)}."
         )
     elif high > 0:
         suggestions.append(
@@ -351,16 +355,16 @@ def _render_insight_dashboard(
     else:
         suggestions.append("⚠️ **Không có ứng viên phù hợp cao** – cân nhắc đăng tuyển thêm.")
 
-    if high_pct < 20 and total >= 5:
+    if high_pct < LOW_MATCH_PCT_THRESHOLD and total >= MIN_CANDIDATES_FOR_LOW_WARNING:
         suggestions.append(
-            "📉 Tỷ lệ phù hợp thấp (<20%) – xem xét **hạ yêu cầu** hoặc **mở rộng phạm vi tuyển**."
+            f"📉 Tỷ lệ phù hợp thấp (<{LOW_MATCH_PCT_THRESHOLD}%) – xem xét **hạ yêu cầu** hoặc **mở rộng phạm vi tuyển**."
         )
 
     if jd_skills:
         for skill in jd_skills:
             missing_count = sum(1 for r in results if skill in r.skills_missing)
             pct = round(missing_count / total * 100)
-            if pct >= 60:
+            if pct >= SKILL_GAP_WARNING_THRESHOLD:
                 suggestions.append(
                     f"🔍 **{pct}% ứng viên thiếu {skill}** – xem xét giảm yêu cầu hoặc cung cấp đào tạo."
                 )

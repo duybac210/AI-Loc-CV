@@ -16,7 +16,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from config import SKILL_KEYWORDS, TOP_K_EVIDENCE, WEIGHT_SEMANTIC, WEIGHT_SKILL
+from config import (
+    SKILL_KEYWORDS, TOP_K_EVIDENCE, WEIGHT_SEMANTIC, WEIGHT_SKILL,
+    MAX_EXPERIENCE_YEARS, EXPERIENCE_NORMALIZATION_YEARS,
+    MIN_CV_LENGTH, MAX_SKILLS_WITHOUT_PROJECT, MAX_SKILL_DENSITY,
+)
 from modules.embedding_manager import encode, top_k_chunks
 from modules.pdf_processor import chunk_text
 
@@ -134,7 +138,7 @@ def _extract_experience_years(text: str) -> int:
         for m in re.finditer(pat, text, re.IGNORECASE):
             try:
                 y = int(m.group(1))
-                if 0 < y <= 40:
+                if 0 < y <= MAX_EXPERIENCE_YEARS:
                     max_years = max(max_years, y)
             except (ValueError, IndexError):
                 pass
@@ -208,17 +212,17 @@ def _detect_red_flags(
     clean = cv_text.strip()
 
     # Very short CV
-    if len(clean) < 300:
-        flags.append("CV rất ngắn (< 300 ký tự)")
+    if len(clean) < MIN_CV_LENGTH:
+        flags.append(f"CV rất ngắn (< {MIN_CV_LENGTH} ký tự)")
 
     # Many skills claimed but no projects described
     all_cv_skills = _extract_skills(cv_text, SKILL_KEYWORDS)
-    if len(all_cv_skills) > 15 and not has_proj:
-        flags.append("Nhiều kỹ năng (>15) nhưng không có dự án thực tế")
+    if len(all_cv_skills) > MAX_SKILLS_WITHOUT_PROJECT and not has_proj:
+        flags.append(f"Nhiều kỹ năng (>{MAX_SKILLS_WITHOUT_PROJECT}) nhưng không có dự án thực tế")
 
     # Abnormally high skill density relative to text length
     word_count = len(clean.split())
-    if word_count > 0 and len(all_cv_skills) / max(word_count, 1) > 0.05:
+    if word_count > 0 and len(all_cv_skills) / max(word_count, 1) > MAX_SKILL_DENSITY:
         flags.append("Mật độ kỹ năng bất thường (có thể liệt kê thiếu context)")
 
     # No experience information at all
@@ -309,7 +313,7 @@ def analyze_cv(
 
     # --- experience ---
     experience_years = _extract_experience_years(cv_text)
-    experience_score = min(1.0, experience_years / 5.0)
+    experience_score = min(1.0, experience_years / EXPERIENCE_NORMALIZATION_YEARS)
 
     # --- project detection ---
     has_projects = _check_has_projects(cv_text)

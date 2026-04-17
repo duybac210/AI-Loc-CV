@@ -29,6 +29,21 @@ WEIGHT_SEMANTIC    = 0.65   # semantic similarity weight
 WEIGHT_SKILL       = 0.35   # skill coverage weight
 WEIGHT_EXPERIENCE  = 0.0    # experience score weight (0 = disabled by default)
 
+# Experience parsing / scoring
+MAX_EXPERIENCE_YEARS          = 40    # sanity cap on detected years
+EXPERIENCE_NORMALIZATION_YEARS = 5.0  # full score (1.0) at this many years
+
+# Red flag detection thresholds
+MIN_CV_LENGTH              = 300    # chars below which CV is flagged as too short
+MAX_SKILLS_WITHOUT_PROJECT = 15     # skill count above which no-project is a red flag
+MAX_SKILL_DENSITY          = 0.05   # skill_count/word_count ratio flagged as abnormal
+
+# Insight dashboard thresholds
+MIN_CANDIDATES_FOR_INTERVIEW    = 5   # ≥ this many high-match → suggest interviews
+MIN_CANDIDATES_FOR_LOW_WARNING  = 5   # need at least this many CVs to warn on low %
+LOW_MATCH_PCT_THRESHOLD         = 20  # if high-match% < this → suggest lowering bar
+SKILL_GAP_WARNING_THRESHOLD     = 60  # if X% of CVs missing a skill → warn HR
+
 # SQLite database path (relative to app root)
 DATABASE_PATH = "cv_screening.db"
 
