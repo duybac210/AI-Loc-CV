@@ -31,6 +31,7 @@ def results_to_dataframe(results: list[CVResult]) -> pd.DataFrame:
     Columns
     -------
     Rank | Filename | Match Score (%) | Semantic (%) | Skill Coverage (%)
+    | Experience (years) | Has Projects | Tags | Red Flags
     | Skills Found | Skills Missing | Summary | Top Evidence
     """
     rows = []
@@ -43,6 +44,10 @@ def results_to_dataframe(results: list[CVResult]) -> pd.DataFrame:
                 "Match Score (%)": round(r.score * 100, 1),
                 "Semantic (%)": round(r.semantic_score * 100, 1),
                 "Skill Coverage (%)": round(r.skill_score * 100, 1),
+                "Experience (years)": r.experience_years if r.experience_years else "—",
+                "Has Projects": "Yes" if r.has_projects else "No",
+                "Tags": " | ".join(r.tags) if r.tags else "—",
+                "Red Flags": " | ".join(r.red_flags) if r.red_flags else "—",
                 "Skills Found": ", ".join(r.skills_found) if r.skills_found else "—",
                 "Skills Missing": ", ".join(r.skills_missing) if r.skills_missing else "—",
                 "Summary": r.summary,

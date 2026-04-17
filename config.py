@@ -25,8 +25,9 @@ SCORE_MED  = 0.50   # yellow ≥ 50 %
 # below SCORE_MED  → red
 
 # Composite score weights
-WEIGHT_SEMANTIC = 0.65   # semantic similarity weight
-WEIGHT_SKILL    = 0.35   # skill coverage weight
+WEIGHT_SEMANTIC    = 0.65   # semantic similarity weight
+WEIGHT_SKILL       = 0.35   # skill coverage weight
+WEIGHT_EXPERIENCE  = 0.0    # experience score weight (0 = disabled by default)
 
 # SQLite database path (relative to app root)
 DATABASE_PATH = "cv_screening.db"
