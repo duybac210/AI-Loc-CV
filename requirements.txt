@@ -1,0 +1,11 @@
+# Dependencies
+
+- streamlit
+- pandas
+- numpy
+- PyPDF2
+- sklearn
+- nltk
+- openai
+- requests
+- joblib
