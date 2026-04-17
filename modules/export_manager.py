@@ -30,7 +30,8 @@ def results_to_dataframe(results: list[CVResult]) -> pd.DataFrame:
 
     Columns
     -------
-    Rank | Filename | Match Score (%) | Skills Found | Skills Missing | Top Evidence
+    Rank | Filename | Match Score (%) | Semantic (%) | Skill Coverage (%)
+    | Skills Found | Skills Missing | Summary | Top Evidence
     """
     rows = []
     for rank, r in enumerate(results, start=1):
@@ -40,8 +41,11 @@ def results_to_dataframe(results: list[CVResult]) -> pd.DataFrame:
                 "Rank": rank,
                 "Filename": r.filename,
                 "Match Score (%)": round(r.score * 100, 1),
+                "Semantic (%)": round(r.semantic_score * 100, 1),
+                "Skill Coverage (%)": round(r.skill_score * 100, 1),
                 "Skills Found": ", ".join(r.skills_found) if r.skills_found else "—",
                 "Skills Missing": ", ".join(r.skills_missing) if r.skills_missing else "—",
+                "Summary": r.summary,
                 "Top Evidence": evidence_text,
             }
         )
