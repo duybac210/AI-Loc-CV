@@ -221,7 +221,7 @@ def render_main():
                 sim_pct = round(sim * 100, 1)
                 st.markdown(
                     f"<div style='background:#f0f4ff;border-left:4px solid #4a90e2;"
-                    f"padding:8px 12px;margin:4px 0;border-radius:4px;'>"
+                    f"padding:8px 12px;margin:4px 0;border-radius:4px;color:#1a1a1a;'>"
                     f"<small>Evidence #{i} – similarity {sim_pct}%</small><br>{chunk}"
                     f"</div>",
                     unsafe_allow_html=True,
