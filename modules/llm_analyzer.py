@@ -315,3 +315,208 @@ def generate_llm_summary(
     result.culture_fit = llm_res.culture_fit
 
     return llm_res
+
+
+# ---------------------------------------------------------------------------
+# Additional AI helpers: candidate comparison, JD skill extraction, CV sections
+# ---------------------------------------------------------------------------
+
+def generate_comparison_summary(
+    config: LLMConfig,
+    top_candidates: list[tuple["CVResult", float]],
+    jd_text: str,
+) -> str:
+    """
+    Generate a concise natural-language comparison of the top-N candidates.
+
+    Parameters
+    ----------
+    config         : LLMConfig   provider configuration
+    top_candidates : list of (CVResult, score) – up to 3 candidates
+    jd_text        : str         raw job description text
+
+    Returns
+    -------
+    str  – plain Vietnamese text comparing candidates. Empty string on error.
+    """
+    if not config.is_configured() or len(top_candidates) < 2:
+        return ""
+
+    lines = [f"=== MÔ TẢ CÔNG VIỆC ===\n{jd_text[:800]}\n\n=== ỨNG VIÊN (đã xếp hạng) ==="]
+    for i, (r, score) in enumerate(top_candidates[:3], 1):
+        lines.append(
+            f"\n#{i} {r.candidate_name or r.filename} – Điểm tổng hợp: {round(score * 100, 1)}%\n"
+            f"  Kỹ năng phù hợp: {', '.join(r.skills_found[:8]) or 'Không xác định'}\n"
+            f"  Thiếu must-have: {', '.join(r.must_have_missing[:5]) or 'Không'}\n"
+            f"  Kinh nghiệm: {r.experience_years} năm\n"
+            f"  Job hopping: {'Có' if r.job_hopping else 'Không'}"
+        )
+
+    prompt = (
+        "\n".join(lines)
+        + "\n\nViết 3–5 câu tiếng Việt: so sánh các ứng viên và giải thích vì sao ứng viên #1 "
+        "phù hợp nhất (hoặc nhận xét nếu điểm thấp). Nêu điểm khác biệt chính giữa họ. "
+        "Văn phong tự nhiên như HR thật, không dùng JSON, không dùng bullet point."
+    )
+
+    try:
+        if config.provider == "openai":
+            import openai
+            resp = openai.OpenAI(api_key=config.api_key).chat.completions.create(
+                model=config.model or _DEFAULT_MODELS["openai"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=300,
+            )
+            return resp.choices[0].message.content or ""
+        elif config.provider == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=config.api_key)
+            return (
+                genai.GenerativeModel(config.model or _DEFAULT_MODELS["gemini"])
+                .generate_content(prompt)
+                .text or ""
+            )
+        elif config.provider == "groq":
+            from groq import Groq
+            resp = Groq(api_key=config.api_key).chat.completions.create(
+                model=config.model or _DEFAULT_MODELS["groq"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=300,
+            )
+            return resp.choices[0].message.content or ""
+    except Exception as exc:
+        return f"[Lỗi so sánh: {exc}]"
+    return ""
+
+
+def extract_jd_skills_llm(
+    config: LLMConfig,
+    jd_text: str,
+) -> tuple[list[str], list[str]]:
+    """
+    Use the LLM to extract must-have and nice-to-have skills from a JD.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        (must_have, nice_to_have) — both may be empty on failure or when not configured.
+    """
+    if not config.is_configured():
+        return [], []
+
+    prompt = (
+        f"Phân tích Job Description sau và liệt kê kỹ năng kỹ thuật cần thiết.\n\n"
+        f"JD:\n{jd_text[:2000]}\n\n"
+        f'Trả về JSON với 2 key:\n'
+        f'  "must_have": danh sách kỹ năng bắt buộc (tên ngắn, ví dụ "Python", "Docker")\n'
+        f'  "nice_to_have": danh sách kỹ năng ưu tiên / bonus\n'
+        f"Chỉ JSON thuần tuý, không markdown, không giải thích thêm."
+    )
+
+    raw = ""
+    try:
+        if config.provider == "openai":
+            import openai
+            resp = openai.OpenAI(api_key=config.api_key).chat.completions.create(
+                model=config.model or _DEFAULT_MODELS["openai"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=400,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content or ""
+        elif config.provider == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=config.api_key)
+            raw = (
+                genai.GenerativeModel(config.model or _DEFAULT_MODELS["gemini"])
+                .generate_content(prompt + "\nTrả về JSON thuần tuý.")
+                .text or ""
+            )
+        elif config.provider == "groq":
+            from groq import Groq
+            resp = Groq(api_key=config.api_key).chat.completions.create(
+                model=config.model or _DEFAULT_MODELS["groq"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=400,
+            )
+            raw = resp.choices[0].message.content or ""
+    except Exception:
+        return [], []
+
+    data = _extract_json(raw)
+    must = [str(s).strip() for s in data.get("must_have", []) if s]
+    nice = [str(s).strip() for s in data.get("nice_to_have", []) if s]
+    return must, nice
+
+
+def parse_cv_sections_llm(
+    config: LLMConfig,
+    cv_text: str,
+) -> dict[str, str]:
+    """
+    Use the LLM to segment a CV into named sections.
+
+    Useful as a fallback when regex-based :func:`parse_cv_sections` yields
+    mostly empty results (e.g. non-standard CV layouts or Vietnamese-only CVs).
+
+    Returns
+    -------
+    dict[str, str]
+        Keys: ``"experience"``, ``"skills"``, ``"education"``,
+        ``"projects"``, ``"summary"``.
+        Values are the extracted section text (empty string if not found).
+        Returns ``{}`` on any error or when not configured.
+    """
+    if not config.is_configured() or not cv_text.strip():
+        return {}
+
+    prompt = (
+        f"Đây là nội dung CV (có thể tiếng Việt hoặc tiếng Anh):\n\n"
+        f"{cv_text[:3000]}\n\n"
+        f"Hãy trích xuất và phân loại theo các mục:\n"
+        f'Trả về JSON với các key: "experience", "skills", "education", "projects", "summary"\n'
+        f"Mỗi key chứa toàn bộ nội dung của mục đó dưới dạng chuỗi văn bản. "
+        f"Nếu không tìm thấy một mục, để chuỗi rỗng. Chỉ JSON thuần tuý, không markdown."
+    )
+
+    raw = ""
+    try:
+        if config.provider == "openai":
+            import openai
+            resp = openai.OpenAI(api_key=config.api_key).chat.completions.create(
+                model=config.model or _DEFAULT_MODELS["openai"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=900,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content or ""
+        elif config.provider == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=config.api_key)
+            raw = (
+                genai.GenerativeModel(config.model or _DEFAULT_MODELS["gemini"])
+                .generate_content(prompt + "\nTrả về JSON thuần tuý.")
+                .text or ""
+            )
+        elif config.provider == "groq":
+            from groq import Groq
+            resp = Groq(api_key=config.api_key).chat.completions.create(
+                model=config.model or _DEFAULT_MODELS["groq"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=900,
+            )
+            raw = resp.choices[0].message.content or ""
+    except Exception:
+        return {}
+
+    data = _extract_json(raw)
+    return {
+        k: str(data.get(k, ""))
+        for k in ("experience", "skills", "education", "projects", "summary")
+    }

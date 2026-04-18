@@ -706,3 +706,26 @@ def analyze_cv(
 def rank_results(results: list[CVResult]) -> list[CVResult]:
     """Return results sorted by composite score descending."""
     return sorted(results, key=lambda r: r.score, reverse=True)
+
+
+def extract_experience_from_text(text: str) -> tuple[int, str]:
+    """
+    Public API: extract years-of-experience from arbitrary text.
+
+    Returns
+    -------
+    tuple[int, str]  – (years, source)
+        source is "stated" | "inferred_from_dates" | ""
+    """
+    return _extract_experience_years(text)
+
+
+def extract_cv_skills(cv_text: str) -> list[str]:
+    """
+    Public API: extract all skill names from *cv_text* using the SKILL_KEYWORDS catalogue.
+
+    Returns
+    -------
+    list[str]  – skill names that appear in the text
+    """
+    return _extract_skills(cv_text, SKILL_KEYWORDS)
