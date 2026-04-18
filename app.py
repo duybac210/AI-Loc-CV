@@ -22,12 +22,13 @@ from config import (
     WEIGHT_SEMANTIC,
     WEIGHT_SKILL,
     WEIGHT_EXPERIENCE,
+    EXPERIENCE_NORMALIZATION_YEARS,
     MIN_CANDIDATES_FOR_INTERVIEW,
     MIN_CANDIDATES_FOR_LOW_WARNING,
     LOW_MATCH_PCT_THRESHOLD,
     SKILL_GAP_WARNING_THRESHOLD,
 )
-from modules.cv_analyzer import CVResult, analyze_cv, extract_jd_skills, rank_results
+from modules.cv_analyzer import CVResult, analyze_cv, extract_jd_skills, extract_experience_from_text, extract_cv_skills, rank_results
 from modules.database_manager import (
     delete_session,
     get_session_jd,
@@ -40,7 +41,11 @@ from modules.database_manager import (
 from modules.embedding_manager import encode, get_model
 from modules.export_manager import results_to_dataframe, to_csv_bytes, to_excel_bytes, to_pdf_bytes
 from modules.jd_parser import JDSummary, parse_jd
-from modules.llm_analyzer import LLMConfig, LLMResult, generate_llm_summary, SUPPORTED_PROVIDERS
+from modules.llm_analyzer import (
+    LLMConfig, LLMResult, generate_llm_summary,
+    generate_comparison_summary, extract_jd_skills_llm,
+    parse_cv_sections_llm, SUPPORTED_PROVIDERS,
+)
 from modules.pdf_processor import extract_text_from_pdf, extract_text_from_docx, OCR_PREFIX
 
 # ---------------------------------------------------------------------------
@@ -167,28 +172,42 @@ def render_sidebar():
         st.divider()
 
         # LLM settings
-        st.markdown("### ✨ AI nâng cao (LLM)")
-        st.caption("Tạo nhận xét tự nhiên + gợi ý câu hỏi phỏng vấn")
-        llm_enabled = st.toggle("Bật AI nâng cao", value=False, key="llm_enabled")
-        if llm_enabled:
-            llm_provider = st.selectbox(
-                "Provider",
-                options=list(SUPPORTED_PROVIDERS),
-                key="llm_provider",
-            )
-            llm_api_key = st.text_input(
-                "API Key",
-                type="password",
-                placeholder="sk-... / AIza... / gsk_...",
-                key="llm_api_key",
-            )
-            llm_model = st.text_input(
-                "Model (để trống = mặc định)",
-                placeholder="gpt-4o-mini / gemini-1.5-flash / llama3-8b-8192",
-                key="llm_model",
-            )
-            if not llm_api_key:
-                st.caption("ℹ️ Nhập API key để kích hoạt. Key không được lưu vào database.")
+        with st.container(border=True):
+            st.markdown("### ✨ AI phân tích nâng cao")
+            st.caption("Nhận xét tự nhiên · Câu hỏi phỏng vấn · So sánh ứng viên")
+            llm_enabled = st.toggle("Bật AI nâng cao (LLM)", value=False, key="llm_enabled")
+            if llm_enabled:
+                llm_provider = st.selectbox(
+                    "Provider",
+                    options=["groq", "openai", "gemini"],
+                    key="llm_provider",
+                )
+                if st.session_state.get("llm_provider", "groq") == "groq":
+                    st.markdown(
+                        "💡 **Groq miễn phí!** Lấy API key tại "
+                        "[console.groq.com](https://console.groq.com) "
+                        "(đăng ký nhanh, không cần thẻ tín dụng)"
+                    )
+                llm_api_key = st.text_input(
+                    "API Key",
+                    type="password",
+                    placeholder="gsk_... (Groq) / sk-... (OpenAI) / AIza... (Gemini)",
+                    key="llm_api_key",
+                )
+                llm_model = st.text_input(
+                    "Model (để trống = mặc định)",
+                    placeholder="llama3-8b-8192 / gpt-4o-mini / gemini-1.5-flash",
+                    key="llm_model",
+                )
+                if llm_api_key:
+                    st.success("✅ AI nâng cao đã được cấu hình")
+                else:
+                    st.info("ℹ️ Nhập API key để bật. Key không được lưu vào database.")
+            else:
+                st.caption(
+                    "🔒 Đang dùng AI ngữ nghĩa (embedding). "
+                    "Bật toggle để thêm LLM (nhận xét, câu hỏi, so sánh)."
+                )
         st.divider()
 
         st.markdown("### Hướng dẫn sử dụng")
@@ -206,9 +225,10 @@ def render_sidebar():
 
         # Technical info in expander (hidden by default)
         with st.expander("⚙️ Thông tin kỹ thuật", expanded=False):
-            st.markdown("**AI Engine:** `paraphrase-multilingual-MiniLM-L12-v2`")
+            st.markdown("**Embedding AI:** `paraphrase-multilingual-MiniLM-L12-v2`")
+            st.markdown("**LLM:** Groq (miễn phí) / OpenAI / Gemini")
             st.markdown("**Ngôn ngữ:** Tiếng Việt + Tiếng Anh (cross-lingual)")
-            st.markdown("**Phương pháp:** Semantic embeddings + Skill coverage + Experience")
+            st.markdown("**Phương pháp:** Semantic embeddings + Skill coverage + LLM analysis")
             st.markdown("**PDF hỗ trợ:** pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract)")
             st.markdown("**DOCX hỗ trợ:** python-docx (paragraphs + tables)")
 
@@ -417,7 +437,7 @@ def _get_llm_config() -> LLMConfig:
     if not st.session_state.get("llm_enabled", False):
         return LLMConfig()
     return LLMConfig(
-        provider=st.session_state.get("llm_provider", "openai"),
+        provider=st.session_state.get("llm_provider", "groq"),
         api_key=st.session_state.get("llm_api_key", ""),
         model=st.session_state.get("llm_model", ""),
     )
@@ -431,6 +451,73 @@ def _decision_color(decision: str) -> str:
     if decision == "Reject":
         return "#e74c3c"
     return "#95a5a6"
+
+
+def _render_candidate_radar(
+    result: CVResult,
+    score: float,
+    llm_result: "LLMResult | None",
+    key_suffix: str = "",
+) -> None:
+    """
+    Mini radar chart showing AI score breakdown for one candidate.
+    Dimensions: Ngữ nghĩa, Kỹ năng, Kinh nghiệm, ATS Score, Tiềm năng.
+    """
+    sem = round(result.semantic_score * 100, 1)
+    skill = round(result.skill_score * 100, 1)
+    exp_norm = round(min(100.0, (result.experience_years or 0) / 5.0 * 100), 1)
+    ats = round(llm_result.ats_score, 1) if llm_result and llm_result.ats_score else sem
+    potential_map = {"High": 90, "Medium": 60, "Low": 25}
+    potential = potential_map.get(
+        (llm_result.potential_level or "") if llm_result else "", 50
+    )
+
+    categories = ["Ngữ nghĩa", "Kỹ năng", "Kinh nghiệm", "ATS Score", "Tiềm năng"]
+    values = [sem, skill, exp_norm, ats, potential]
+    values_closed = values + [values[0]]
+    cats_closed = categories + [categories[0]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values_closed,
+        theta=cats_closed,
+        fill="toself",
+        fillcolor="rgba(74,144,226,0.2)",
+        line=dict(color="#4a90e2", width=2),
+        name=result.candidate_name or result.filename,
+    ))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        title="📡 AI Score Breakdown",
+        height=320,
+        margin=dict(l=20, r=20, t=40, b=20),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"cand_radar_{key_suffix}")
+
+
+def _render_ai_comparison_summary(
+    display_list: list[tuple[CVResult, float]],
+    jd_text: str,
+    llm_config: LLMConfig,
+) -> None:
+    """Show an AI-generated comparison paragraph for the top-N candidates."""
+    if not llm_config.is_configured() or len(display_list) < 2:
+        return
+
+    top = display_list[:3]
+    cache_key = "ai_comparison_" + "_".join(r.filename for r, _ in top)
+
+    if cache_key not in st.session_state:
+        with st.spinner("✨ AI đang so sánh top ứng viên..."):
+            text = generate_comparison_summary(llm_config, top, jd_text)
+        st.session_state[cache_key] = text
+
+    text = st.session_state.get(cache_key, "")
+    if text and not text.startswith("[Lỗi"):
+        n = len(top)
+        st.markdown(f"#### 🤖 AI So sánh Top {n} ứng viên")
+        st.info(f"✨ {text}")
 
 
 def _render_candidate_cards(
@@ -454,19 +541,17 @@ def _render_candidate_cards(
                 _skill_badge(f"⚠️ {f}", "#c0392b") for f in result.red_flags
             )
 
-        # Show decision badge in header if set
         decision_state_key = f"decision_{result.filename}_{rank}"
         current_decision = st.session_state.get(decision_state_key, "")
         decision_badge = ""
         if current_decision:
             dcolor = _decision_color(current_decision)
-            decision_badge = f' <span style="background:{dcolor};color:white;padding:2px 8px;border-radius:10px;font-size:0.8em">{current_decision}</span>'
+            decision_badge = (
+                f' <span style="background:{dcolor};color:white;padding:2px 8px;'
+                f'border-radius:10px;font-size:0.8em">{current_decision}</span>'
+            )
 
-        # Contact info in header
-        contact_str = ""
-        if result.candidate_name:
-            contact_str = f" — {result.candidate_name}"
-
+        contact_str = f" — {result.candidate_name}" if result.candidate_name else ""
         header_html = f"#{rank}{contact_str} · {result.filename} – {icon} {pct}%{decision_badge}"
 
         with st.expander(header_html, expanded=(rank == 1)):
@@ -478,150 +563,257 @@ def _render_candidate_cards(
                 ci3.markdown(f"**📞 SĐT:** {result.phone or '—'}")
                 st.markdown("")
 
-            # Tags row
             if result.tags or result.red_flags:
                 st.markdown(tag_html + red_flag_html, unsafe_allow_html=True)
                 st.markdown("")
 
-            # Score breakdown with progress bars
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Tổng điểm", f"{pct}%")
-            sc1.progress(score)
-            sc2.metric("Ngữ nghĩa", f"{round(result.semantic_score * 100, 1)}%")
-            sc2.progress(result.semantic_score)
-            sc3.metric("Kỹ năng", f"{round(result.skill_score * 100, 1)}%")
-            sc3.progress(result.skill_score)
-            if result.experience_years:
-                _src = result.experience_source
-                _src_label = {
-                    "stated": "tự khai",
-                    "inferred_from_dates": "suy ra từ ngày tháng",
-                }.get(_src, "")
-                _exp_label = f"{result.experience_years} năm"
-                _exp_delta = _src_label or None
-                sc4.metric("Kinh nghiệm", _exp_label, delta=_exp_delta, delta_color="off")
-            else:
-                sc4.metric("Kinh nghiệm", "⚠️ Không xác định")
-
-            # Must-have / nice-to-have gap
-            if result.must_have_missing or result.nice_to_have_missing:
-                gap_col1, gap_col2 = st.columns(2)
-                with gap_col1:
-                    if result.must_have_missing:
-                        badges = " ".join(_skill_badge(s, "#c0392b") for s in result.must_have_missing)
-                        st.markdown("**🔴 Thiếu must-have:** " + badges, unsafe_allow_html=True)
-                with gap_col2:
-                    if result.nice_to_have_missing:
-                        badges = " ".join(_skill_badge(s, "#d68910") for s in result.nice_to_have_missing)
-                        st.markdown("**🟡 Thiếu nice-to-have:** " + badges, unsafe_allow_html=True)
-
-            # Structured explanation
-            st.markdown("**Phân tích chi tiết:**")
-            exp_col, skill_col = st.columns(2)
-            with exp_col:
-                st.markdown("**✅ Điểm mạnh:**")
-                if result.experience_years > 0:
-                    st.markdown(f"- {result.experience_years} năm kinh nghiệm")
-                if result.has_projects:
-                    st.markdown("- Có dự án thực tế")
-                if result.skills_found:
-                    for skill in result.skills_found:
-                        st.markdown(f"- ✔ {skill}")
-                else:
-                    st.markdown("*Chưa khớp kỹ năng nào trong JD*")
-            with skill_col:
-                st.markdown("**❌ Còn thiếu:**")
-                if result.skills_missing:
-                    for skill in result.skills_missing:
-                        st.markdown(f"- ✗ {skill}")
-                else:
-                    st.markdown("*Đủ tất cả kỹ năng yêu cầu!* 🎉")
-
-            # Red flags
-            if result.red_flags:
-                st.warning(
-                    "⚠️ **Cảnh báo chất lượng CV:**\n"
-                    + "\n".join(f"- {f}" for f in result.red_flags)
-                )
-
-            # LLM-enhanced summary
+            # ---- Eager LLM call (cached) ----
             summary_key = f"llm_summary_{result.filename}_{rank}"
             questions_key = f"llm_questions_{result.filename}_{rank}"
             llm_result_key = f"llm_result_{result.filename}_{rank}"
 
-            if llm_config.is_configured():
-                if summary_key not in st.session_state:
-                    with st.spinner("✨ AI đang tạo nhận xét..."):
-                        llm_res: LLMResult = generate_llm_summary(
-                            llm_config, result.full_text, jd_text, result
-                        )
-                    st.session_state[summary_key] = llm_res.summary
-                    st.session_state[questions_key] = llm_res.interview_questions
-                    st.session_state[llm_result_key] = llm_res
-                    if llm_res.decision and not current_decision:
-                        st.session_state[decision_state_key] = llm_res.decision
-                st.info(f"✨ **Nhận xét AI nâng cao:** {st.session_state[summary_key]}")
+            if llm_config.is_configured() and summary_key not in st.session_state:
+                with st.spinner("✨ AI đang phân tích ứng viên..."):
+                    llm_res: LLMResult = generate_llm_summary(
+                        llm_config, result.full_text, jd_text, result
+                    )
+                st.session_state[summary_key] = llm_res.summary
+                st.session_state[questions_key] = llm_res.interview_questions
+                st.session_state[llm_result_key] = llm_res
+                if llm_res.decision and not current_decision:
+                    st.session_state[decision_state_key] = llm_res.decision
 
-                # Extended LLM scores
-                cached_llm: LLMResult | None = st.session_state.get(llm_result_key)
-                if cached_llm:
-                    llm_col1, llm_col2, llm_col3, llm_col4 = st.columns(4)
-                    if cached_llm.skill_match:
-                        llm_col1.metric("🎯 Kỹ năng (AI)", f"{round(cached_llm.skill_match)}%")
-                    if cached_llm.experience_match:
-                        llm_col2.metric("📅 KN match (AI)", f"{round(cached_llm.experience_match)}%")
-                    if cached_llm.ats_score:
-                        llm_col3.metric("🔑 ATS Score", f"{round(cached_llm.ats_score)}%")
-                    if cached_llm.potential_level:
-                        llm_col4.metric("🚀 Tiềm năng", cached_llm.potential_level)
-                    if cached_llm.stability:
-                        st.caption(f"📊 Ổn định: {cached_llm.stability}")
-                    if cached_llm.culture_fit:
-                        st.caption(f"🏢 Văn hóa: {cached_llm.culture_fit}")
+            cached_llm: LLMResult | None = st.session_state.get(llm_result_key)
 
-                questions = st.session_state.get(questions_key, [])
-                if questions:
-                    with st.expander("💬 Gợi ý câu hỏi phỏng vấn (AI)", expanded=False):
-                        for i, q in enumerate(questions, 1):
-                            st.markdown(f"{i}. {q}")
-            else:
-                st.info(f"💡 **Nhận xét AI:** {result.summary}")
+            # ---- Three tabs per candidate ----
+            tab_analysis, tab_ai, tab_questions = st.tabs([
+                "📊 Phân tích",
+                "✨ AI Insights",
+                "💬 Câu hỏi phỏng vấn",
+            ])
 
-            # HR Decision buttons
-            st.markdown("**Quyết định HR:**")
-            btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
-            with btn_col1:
-                if st.button("✅ Shortlist", key=f"sl_{result.filename}_{rank}"):
-                    st.session_state[decision_state_key] = "Shortlist"
-                    st.rerun()
-            with btn_col2:
-                if st.button("⏸ Cân nhắc", key=f"cs_{result.filename}_{rank}"):
-                    st.session_state[decision_state_key] = "Consider"
-                    st.rerun()
-            with btn_col3:
-                if st.button("❌ Loại", key=f"rj_{result.filename}_{rank}"):
-                    st.session_state[decision_state_key] = "Reject"
-                    st.rerun()
-            with btn_col4:
-                if current_decision:
-                    dcolor = _decision_color(current_decision)
+            # -----------------------------------------------------------
+            # Tab 1: Phân tích – scores, skills, evidence, HR decision
+            # -----------------------------------------------------------
+            with tab_analysis:
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("Tổng điểm", f"{pct}%")
+                sc1.progress(score)
+                sc2.metric("Ngữ nghĩa (AI)", f"{round(result.semantic_score * 100, 1)}%")
+                sc2.progress(result.semantic_score)
+                sc3.metric("Kỹ năng", f"{round(result.skill_score * 100, 1)}%")
+                sc3.progress(result.skill_score)
+                if result.experience_years:
+                    _src_label = {
+                        "stated": "tự khai",
+                        "inferred_from_dates": "suy ra từ ngày tháng",
+                        "ai_section_parsed": "AI section parser",
+                    }.get(result.experience_source, "")
+                    sc4.metric(
+                        "Kinh nghiệm", f"{result.experience_years} năm",
+                        delta=_src_label or None, delta_color="off",
+                    )
+                else:
+                    sc4.metric("Kinh nghiệm", "⚠️ Không xác định")
+
+                # Score formula explainer
+                _w_sem = st.session_state.get("w_semantic", 65)
+                _w_sk = st.session_state.get("w_skill", 35)
+                _w_exp = st.session_state.get("w_experience", 0)
+                _total_w = max(_w_sem + _w_sk + _w_exp, 1)
+                _formula = (
+                    f"🧮 **Công thức điểm AI:** "
+                    f"Ngữ nghĩa {round(_w_sem/_total_w*100)}% × {round(result.semantic_score*100,1)}% "
+                    f"+ Kỹ năng {round(_w_sk/_total_w*100)}% × {round(result.skill_score*100,1)}%"
+                )
+                if _w_exp > 0:
+                    _formula += f" + Kinh nghiệm {round(_w_exp/_total_w*100)}% × {round(result.experience_score*100,1)}%"
+                _formula += f" = **{pct}%**"
+                st.caption(_formula)
+
+                # Must-have / nice-to-have gap
+                if result.must_have_missing or result.nice_to_have_missing:
+                    gap_col1, gap_col2 = st.columns(2)
+                    with gap_col1:
+                        if result.must_have_missing:
+                            badges = " ".join(
+                                _skill_badge(s, "#c0392b") for s in result.must_have_missing
+                            )
+                            st.markdown("**🔴 Thiếu must-have:** " + badges, unsafe_allow_html=True)
+                    with gap_col2:
+                        if result.nice_to_have_missing:
+                            badges = " ".join(
+                                _skill_badge(s, "#d68910") for s in result.nice_to_have_missing
+                            )
+                            st.markdown("**🟡 Thiếu nice-to-have:** " + badges, unsafe_allow_html=True)
+
+                st.markdown("**Phân tích chi tiết:**")
+                exp_col, skill_col = st.columns(2)
+                with exp_col:
+                    st.markdown("**✅ Điểm mạnh:**")
+                    if result.experience_years > 0:
+                        st.markdown(f"- {result.experience_years} năm kinh nghiệm")
+                    if result.has_projects:
+                        st.markdown("- Có dự án thực tế")
+                    if result.skills_found:
+                        for skill in result.skills_found:
+                            st.markdown(f"- ✔ {skill}")
+                    else:
+                        st.markdown("*Chưa khớp kỹ năng nào trong JD*")
+                with skill_col:
+                    st.markdown("**❌ Còn thiếu:**")
+                    if result.skills_missing:
+                        for skill in result.skills_missing:
+                            st.markdown(f"- ✗ {skill}")
+                    else:
+                        st.markdown("*Đủ tất cả kỹ năng yêu cầu!* 🎉")
+
+                if result.red_flags:
+                    st.warning(
+                        "⚠️ **Cảnh báo chất lượng CV:**\n"
+                        + "\n".join(f"- {f}" for f in result.red_flags)
+                    )
+
+                st.markdown("**Đoạn text liên quan nhất (AI Semantic):**")
+                for i, (chunk, sim) in enumerate(result.evidence, start=1):
+                    sim_pct = round(sim * 100, 1)
                     st.markdown(
-                        f'<span style="background:{dcolor};color:white;padding:4px 12px;'
-                        f'border-radius:12px;font-weight:bold">{current_decision}</span>',
+                        f"<div style='background:#f0f4ff;border-left:4px solid #4a90e2;"
+                        f"padding:8px 12px;margin:4px 0;border-radius:4px;color:#1a1a1a;'>"
+                        f"<small>Bằng chứng #{i} – tương đồng ngữ nghĩa {sim_pct}%</small><br>{chunk}"
+                        f"</div>",
                         unsafe_allow_html=True,
                     )
 
-            # Evidence
-            st.markdown("**Đoạn text liên quan nhất (AI):**")
-            for i, (chunk, sim) in enumerate(result.evidence, start=1):
-                sim_pct = round(sim * 100, 1)
-                st.markdown(
-                    f"<div style='background:#f0f4ff;border-left:4px solid #4a90e2;"
-                    f"padding:8px 12px;margin:4px 0;border-radius:4px;color:#1a1a1a;'>"
-                    f"<small>Bằng chứng #{i} – tương đồng {sim_pct}%</small><br>{chunk}"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown("**Quyết định HR:**")
+                btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+                with btn_col1:
+                    if st.button("✅ Shortlist", key=f"sl_{result.filename}_{rank}"):
+                        st.session_state[decision_state_key] = "Shortlist"
+                        st.rerun()
+                with btn_col2:
+                    if st.button("⏸ Cân nhắc", key=f"cs_{result.filename}_{rank}"):
+                        st.session_state[decision_state_key] = "Consider"
+                        st.rerun()
+                with btn_col3:
+                    if st.button("❌ Loại", key=f"rj_{result.filename}_{rank}"):
+                        st.session_state[decision_state_key] = "Reject"
+                        st.rerun()
+                with btn_col4:
+                    if current_decision:
+                        dcolor = _decision_color(current_decision)
+                        st.markdown(
+                            f'<span style="background:{dcolor};color:white;padding:4px 12px;'
+                            f'border-radius:12px;font-weight:bold">{current_decision}</span>',
+                            unsafe_allow_html=True,
+                        )
+
+            # -----------------------------------------------------------
+            # Tab 2: AI Insights – LLM summary, scores, strengths/weaknesses, radar
+            # -----------------------------------------------------------
+            with tab_ai:
+                if cached_llm:
+                    # Decision banner
+                    if cached_llm.decision:
+                        dcolor = _decision_color(cached_llm.decision)
+                        reason = f" — {cached_llm.decision_reason}" if cached_llm.decision_reason else ""
+                        st.markdown(
+                            f'<div style="background:{dcolor};color:white;padding:10px 16px;'
+                            f'border-radius:8px;font-size:1.05em;font-weight:bold;margin-bottom:8px">'
+                            f"🤖 Quyết định AI: {cached_llm.decision}{reason}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # Summary
+                    summary_text = st.session_state.get(summary_key, result.summary)
+                    st.info(f"✨ **Nhận xét AI:** {summary_text}")
+
+                    # LLM scores
+                    ai_c1, ai_c2, ai_c3, ai_c4 = st.columns(4)
+                    if cached_llm.skill_match:
+                        ai_c1.metric("🎯 Kỹ năng (AI)", f"{round(cached_llm.skill_match)}%")
+                    if cached_llm.experience_match:
+                        ai_c2.metric("📅 Kinh nghiệm (AI)", f"{round(cached_llm.experience_match)}%")
+                    if cached_llm.ats_score:
+                        ai_c3.metric("🔑 ATS Score", f"{round(cached_llm.ats_score)}%")
+                    if cached_llm.potential_level:
+                        _lvl_emoji = {"High": "🚀", "Medium": "📈", "Low": "📉"}.get(
+                            cached_llm.potential_level, ""
+                        )
+                        ai_c4.metric(f"{_lvl_emoji} Tiềm năng", cached_llm.potential_level)
+                    if cached_llm.stability:
+                        st.caption(f"📊 **Ổn định nghề nghiệp:** {cached_llm.stability}")
+                    if cached_llm.culture_fit:
+                        st.caption(f"🏢 **Văn hóa phù hợp:** {cached_llm.culture_fit}")
+
+                    # Strengths & Weaknesses
+                    if cached_llm.strengths or cached_llm.weaknesses:
+                        sw_col1, sw_col2 = st.columns(2)
+                        with sw_col1:
+                            if cached_llm.strengths:
+                                st.markdown("**✅ Điểm mạnh (AI):**")
+                                for s in cached_llm.strengths:
+                                    st.markdown(f"- {s}")
+                        with sw_col2:
+                            if cached_llm.weaknesses:
+                                st.markdown("**⚠️ Điểm yếu (AI):**")
+                                for w in cached_llm.weaknesses:
+                                    st.markdown(f"- {w}")
+
+                    if cached_llm.missing_skills:
+                        badges = " ".join(
+                            _skill_badge(s, "#e74c3c") for s in cached_llm.missing_skills[:8]
+                        )
+                        st.markdown("**🔴 Kỹ năng thiếu (AI):** " + badges, unsafe_allow_html=True)
+
+                    # Per-candidate radar chart
+                    _render_candidate_radar(
+                        result, score, cached_llm,
+                        key_suffix=f"{result.filename}_{rank}",
+                    )
+
+                else:
+                    # LLM not configured – show rule-based summary + CTA
+                    st.info(f"💡 **Nhận xét:** {result.summary}")
+                    st.markdown("")
+                    st.markdown(
+                        "#### ✨ Bật AI nâng cao để xem phân tích chuyên sâu\n\n"
+                        "Với AI nâng cao bạn sẽ có:\n"
+                        "- 🤖 **Quyết định tự động** Shortlist / Consider / Reject\n"
+                        "- 📊 **ATS Score**, **Tiềm năng**, **Mức độ ổn định nghề nghiệp**\n"
+                        "- ✅ **Điểm mạnh / Điểm yếu** được phân tích chi tiết\n"
+                        "- 📡 **Radar chart** đa chiều cho từng ứng viên\n\n"
+                        "👉 **Groq miễn phí:** [console.groq.com](https://console.groq.com) "
+                        "→ Bật toggle **\"AI nâng cao\"** ở sidebar → Nhập API key"
+                    )
+
+            # -----------------------------------------------------------
+            # Tab 3: Câu hỏi phỏng vấn – prominent interview questions
+            # -----------------------------------------------------------
+            with tab_questions:
+                questions = st.session_state.get(questions_key, [])
+                if questions:
+                    st.markdown("#### 💬 Câu hỏi phỏng vấn gợi ý bởi AI")
+                    st.caption(
+                        "Câu hỏi được AI tạo dựa trên JD và hồ sơ ứng viên cụ thể. "
+                        "Điều chỉnh theo nhu cầu thực tế của bạn."
+                    )
+                    for i, q in enumerate(questions, 1):
+                        st.markdown(
+                            f"<div style='background:#f8f0ff;border-left:4px solid #9b59b6;"
+                            f"padding:10px 14px;margin:6px 0;border-radius:6px;color:#1a1a1a;'>"
+                            f"<b>Q{i}.</b> {q}</div>",
+                            unsafe_allow_html=True,
+                        )
+                elif llm_config.is_configured():
+                    st.info("⏳ Câu hỏi phỏng vấn đang được tạo... Mở rộng card ứng viên để kích hoạt.")
+                else:
+                    st.markdown(
+                        "#### 💬 Bật AI để nhận câu hỏi phỏng vấn riêng cho từng ứng viên\n\n"
+                        "AI sẽ tạo **3+ câu hỏi phỏng vấn** phù hợp với hồ sơ cụ thể của ứng viên "
+                        "và yêu cầu trong JD — không phải câu hỏi chung chung.\n\n"
+                        "👉 **Groq miễn phí:** [console.groq.com](https://console.groq.com)"
+                    )
 
     # Show filtered-out candidates at bottom
     if pre_filtered_out:
@@ -805,6 +997,30 @@ def render_analysis_tab():
             jd_embedding = encode([jd_text])[0]
             jd_skills = extract_jd_skills(jd_text)
 
+            # AI-enhanced JD skill extraction (supplements regex results)
+            _llm_cfg = _get_llm_config()
+            _ai_extra_skills: list[str] = []
+            if _llm_cfg.is_configured():
+                with st.spinner("✨ AI đang trích xuất kỹ năng từ JD..."):
+                    _llm_must, _llm_nice = extract_jd_skills_llm(_llm_cfg, jd_text)
+                _ai_extra = [
+                    s for s in _llm_must + _llm_nice
+                    if s not in jd_skills
+                ]
+                if _ai_extra:
+                    _ai_extra_skills = _ai_extra
+                    jd_skills = jd_skills + _ai_extra
+                    # Enrich jd_summary with AI-detected skills
+                    for s in _llm_must:
+                        if s not in jd_summary.must_have:
+                            jd_summary.must_have.append(s)
+                    for s in _llm_nice:
+                        if s not in jd_summary.nice_to_have:
+                            jd_summary.nice_to_have.append(s)
+                    jd_summary.all_skills = list(dict.fromkeys(
+                        jd_summary.all_skills + _ai_extra
+                    ))
+
             raw_results: list[CVResult] = []
             progress = st.progress(0, text="Đang xử lý CV…")
             errors: list[str] = []
@@ -832,6 +1048,30 @@ def render_analysis_tab():
                     jd_skills=jd_skills,
                     jd_summary=jd_summary,
                 )
+
+                # AI section parsing fallback: enrich experience when regex failed
+                if _llm_cfg.is_configured() and result.experience_years == 0:
+                    ai_secs = parse_cv_sections_llm(_llm_cfg, cv_text)
+                    if ai_secs.get("experience"):
+                        ai_exp, _ = extract_experience_from_text(ai_secs["experience"])
+                        if ai_exp > 0:
+                            result.experience_years = ai_exp
+                            result.experience_source = "ai_section_parsed"
+                            result.experience_score = min(
+                                1.0, ai_exp / EXPERIENCE_NORMALIZATION_YEARS
+                            )
+                    # Also try to find skills in AI-parsed skills section
+                    if ai_secs.get("skills") and not result.skills_found:
+                        ai_skills = extract_cv_skills(ai_secs["skills"])
+                        new_found = [s for s in ai_skills if s in jd_skills]
+                        if new_found:
+                            result.skills_found = list(dict.fromkeys(
+                                result.skills_found + new_found
+                            ))
+                            result.skills_missing = [
+                                s for s in jd_skills if s not in result.skills_found
+                            ]
+
                 raw_results.append(result)
                 progress.progress(
                     (i + 1) / len(uploaded_files),
@@ -854,6 +1094,17 @@ def render_analysis_tab():
             st.info(
                 f"🔍 **OCR được dùng cho {len(ocr_files)} file(s):** {', '.join(ocr_files)}. "
                 "Đây là CV dạng ảnh/scan – text được nhận dạng tự động bằng Tesseract OCR."
+            )
+        if _ai_extra_skills:
+            ai_skill_badges = " ".join(
+                f'<span style="background:#8e44ad;color:white;padding:2px 8px;'
+                f'border-radius:10px;margin:2px;font-size:0.82em">{s}</span>'
+                for s in _ai_extra_skills
+            )
+            st.markdown(
+                f"ℹ️ ✨ **AI phát hiện thêm {len(_ai_extra_skills)} kỹ năng từ JD:** "
+                + ai_skill_badges,
+                unsafe_allow_html=True,
             )
 
         st.success(f"✅ Đã lưu kết quả vào lịch sử (Session #{session_id})")
@@ -1065,6 +1316,12 @@ def _render_results(
         jd_skills,
         jd_summary,
     )
+
+    # -------------------------------------------------------------------
+    # AI comparison of top candidates (when LLM configured)
+    # -------------------------------------------------------------------
+    if len(display_list) >= 2:
+        _render_ai_comparison_summary(display_list, jd_text, _get_llm_config())
 
     # -------------------------------------------------------------------
     # Tabs: Detailed Cards | Shortlist | Real-time Filter Table
@@ -1389,17 +1646,19 @@ def render_about_tab():
     st.subheader("ℹ️ Về hệ thống")
     st.markdown(
         """
-### Kiến trúc hệ thống
+### Kiến trúc AI
 
 | Thành phần | Chi tiết |
 |---|---|
-| **AI Model** | `paraphrase-multilingual-MiniLM-L12-v2` (hỗ trợ 50+ ngôn ngữ) |
+| **Embedding AI** | `paraphrase-multilingual-MiniLM-L12-v2` (50+ ngôn ngữ, chạy offline) |
+| **LLM Providers** | Groq (miễn phí 🎉) · OpenAI · Gemini — tuỳ chọn, không bắt buộc |
 | **Ngôn ngữ** | Tiếng Việt + Tiếng Anh (cross-lingual matching) |
 | **PDF Extraction** | pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract vie+eng) |
 | **DOCX Extraction** | python-docx (paragraphs + tables) |
 | **Cơ sở dữ liệu** | SQLite (lưu lịch sử tất cả phiên phân tích) |
-| **JD Parser** | Rule-based: trích xuất must-have / nice-to-have / level / kinh nghiệm |
-| **Scoring** | Composite = Ngữ nghĩa + Kỹ năng + Kinh nghiệm (trọng số tuỳ chỉnh) |
+| **JD Parser** | Regex + AI (LLM trích xuất must-have / nice-to-have chính xác hơn) |
+| **CV Section Parser** | Regex + AI fallback (LLM phân tích CV không theo chuẩn) |
+| **Scoring** | Composite = Ngữ nghĩa (AI) + Kỹ năng + Kinh nghiệm (trọng số tuỳ chỉnh) |
 
 ### Công thức chấm điểm
 
@@ -1411,7 +1670,20 @@ Composite Score   = w_sem × Semantic + w_skill × Skill + w_exp × Experience
                     (w_sem + w_skill + w_exp được chuẩn hóa = 100%)
 ```
 
-### Tính năng mới (v3)
+### 🆕 Tính năng AI nâng cao (v4)
+
+| Tính năng | Mô tả |
+|---|---|
+| **Groq miễn phí** | Groq là provider mặc định — đăng ký miễn phí tại [console.groq.com](https://console.groq.com) |
+| **AI Comparison** | So sánh top-3 ứng viên bằng LLM, giải thích tại sao #1 phù hợp nhất |
+| **AI JD Skill Extraction** | LLM trích xuất must-have / nice-to-have chính xác hơn regex |
+| **AI CV Section Parsing** | LLM phân tích cấu trúc CV khi regex không nhận ra sections |
+| **Tab AI Insights** | Tab riêng: quyết định AI, điểm mạnh/yếu, ATS Score, tiềm năng, văn hóa phù hợp |
+| **Tab Câu hỏi phỏng vấn** | Tab riêng: câu hỏi phỏng vấn nổi bật, phù hợp hồ sơ cụ thể |
+| **Per-candidate Radar** | Radar chart cho từng ứng viên: Ngữ nghĩa / Kỹ năng / Kinh nghiệm / ATS / Tiềm năng |
+| **Score Formula Explainer** | Hiển thị công thức điểm AI chi tiết cho từng ứng viên |
+
+### Tính năng (v3)
 
 | Tính năng | Mô tả |
 |---|---|
