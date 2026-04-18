@@ -18,13 +18,16 @@ from dataclasses import dataclass, field
 
 _SECTION_PATTERNS: dict[str, list[str]] = {
     "experience": [
-        r"kinh\s*nghi[eệ]m\s*(làm\s*vi[eệ]c|ngh[eề]\s*nghi[eệ]p)?",
-        r"work\s*(experience|history|background)",
-        r"professional\s*experience",
+        r"kinh\s*nghi[eệ]m\s*(làm\s*vi[eệ]c|ngh[eề]\s*nghi[eệ]p|công\s*vi[eệ]c)?",
+        r"work\s*(experience|history|background|exp\.?)",
+        r"professional\s*(experience|background)",
         r"employment\s*(history|record)",
+        r"career\s*(history|summary|background|profile)",
         r"experience",
-        r"qu[aá]\s*tr[iì]nh\s*c[oô]ng\s*t[aá]c",
+        r"work\s*exp\.?",
+        r"qu[aá]\s*tr[iì]nh\s*(c[oô]ng\s*t[aá]c|l[aà]m\s*vi[eệ]c)",
         r"l[iị]ch\s*s[uử]\s*c[oô]ng\s*vi[eệ]c",
+        r"kinh\s*nghi[eệ]m",
     ],
     "skills": [
         r"k[yỹ]\s*n[aă]ng",
@@ -69,10 +72,17 @@ _SECTION_PATTERNS: dict[str, list[str]] = {
     ],
 }
 
-# Compile each pattern group into a single regex
+# Compile each pattern group into a single regex.
+# We allow optional leading ordinal/number prefix (e.g. "III. ", "2. ", "A. ")
+# and do NOT require the heading to end at EOL so lines like "Kinh nghiệm làm việc:"
+# are also matched.
+# 100 chars is generous enough to include long section titles with sub-titles while
+# still excluding body text lines (which typically span full paragraphs).
+_MAX_HEADING_LENGTH = 100
+_ORDINAL_PREFIX = r"(?:\d+[\.\)]\s*|[IVXivxA-Za-z]{1,5}[\.\)]\s*)?"
 _COMPILED: dict[str, re.Pattern] = {
     section: re.compile(
-        r"^\s*(?:" + "|".join(patterns) + r")\s*[:\-–—]?\s*$",
+        r"^\s*" + _ORDINAL_PREFIX + r"(?:" + "|".join(patterns) + r")\s*[:\-–—]?\s*",
         re.IGNORECASE | re.MULTILINE,
     )
     for section, patterns in _SECTION_PATTERNS.items()
@@ -134,16 +144,16 @@ def parse_cv_sections(cv_text: str) -> CVSections:
 
         # Check if this line is a section heading
         matched_section: str | None = None
-        if 2 <= len(stripped) <= 80:   # headings are short
+        if 2 <= len(stripped) <= _MAX_HEADING_LENGTH:
             for section, pattern in _COMPILED.items():
-                if pattern.match(stripped + "\n"):   # add \n for multiline ^ $
+                if pattern.match(stripped):
                     matched_section = section
                     break
-            # Also try without the strict line-anchored multiline by testing just the stripped text
+            # Fallback: try without ordinal prefix
             if not matched_section:
                 for section, patterns in _SECTION_PATTERNS.items():
                     combined = re.compile(
-                        r"^(?:" + "|".join(patterns) + r")\s*[:\-–—]?\s*$",
+                        r"^" + _ORDINAL_PREFIX + r"(?:" + "|".join(patterns) + r")\s*[:\-–—]?\s*",
                         re.IGNORECASE,
                     )
                     if combined.match(stripped):
