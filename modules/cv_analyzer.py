@@ -8,11 +8,15 @@ Core analysis logic:
   - extract experience years and project presence
   - generate quick-summary tags
   - detect red flags
+  - extract contact info (name, email, phone)
+  - must-have / nice-to-have weighted scoring
+  - section-aware experience and skill scoring
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -23,6 +27,9 @@ from config import (
 )
 from modules.embedding_manager import encode, top_k_chunks
 from modules.pdf_processor import chunk_text
+
+if TYPE_CHECKING:
+    from modules.jd_parser import JDSummary
 
 
 @dataclass
@@ -39,12 +46,88 @@ class CVResult:
     skills_missing: list[str]
     summary: str = ""                     # short AI-driven candidate summary
     chunks: list[str] = field(default_factory=list)
-    # ---- new fields ----
+    # ---- experience / projects ----
     experience_years: int = 0             # max years of experience found in CV
     experience_score: float = 0.0        # 0-1 normalised experience (÷5 years)
     has_projects: bool = False            # CV mentions concrete projects
     tags: list[str] = field(default_factory=list)        # quick-summary badges
     red_flags: list[str] = field(default_factory=list)   # quality warning flags
+    # ---- contact info (new) ----
+    candidate_name: str = ""             # extracted from CV header
+    email: str = ""                      # extracted via regex
+    phone: str = ""                      # extracted via regex
+    # ---- must-have / nice-to-have (new) ----
+    must_have_missing: list[str] = field(default_factory=list)   # missing must-have skills
+    nice_to_have_missing: list[str] = field(default_factory=list)  # missing nice-to-have skills
+    # ---- job-hopping (new) ----
+    job_hopping: bool = False            # detected from experience section
+    job_count: int = 0                   # estimated number of distinct positions
+
+
+# ---------------------------------------------------------------------------
+# Contact info extraction
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", re.IGNORECASE)
+_PHONE_RE = re.compile(
+    r"(?:"
+    r"(?:\+84|0084|0)\d{9,10}"          # Vietnamese mobile: 0xxxxxxxxx or +84xxxxxxxxx
+    r"|(?:\+\d{1,3}[\s\-]?)?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}"  # international
+    r")"
+)
+_NAME_BLACKLIST = re.compile(
+    r"\b(?:email|phone|address|curriculum\s*vitae|resume|cv|tel|mobile|"
+    r"họ\s*tên|tên|địa\s*chỉ|điện\s*thoại|liên\s*hệ|contact)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_contact_info(cv_text: str) -> tuple[str, str, str]:
+    """
+    Extract (candidate_name, email, phone) from raw CV text.
+
+    Strategy
+    --------
+    - email  : first match of RFC-5321-ish pattern
+    - phone  : first match of Vietnamese/international phone pattern
+    - name   : first non-blank, non-keyword line in the top 10 lines that
+               looks like a name (all words capitalised, length 2–50 chars,
+               no digits)
+
+    Returns
+    -------
+    tuple[str, str, str]  – (name, email, phone) — empty string if not found
+    """
+    # --- email ---
+    email_match = _EMAIL_RE.search(cv_text)
+    email = email_match.group(0) if email_match else ""
+
+    # --- phone ---
+    phone_match = _PHONE_RE.search(cv_text)
+    phone = phone_match.group(0).strip() if phone_match else ""
+
+    # --- name ---
+    name = ""
+    top_lines = cv_text.split("\n")[:15]
+    for raw_line in top_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if len(line) < 2 or len(line) > 60:
+            continue
+        if re.search(r"\d", line):
+            continue
+        if _NAME_BLACKLIST.search(line):
+            continue
+        # Prefer lines where every word starts with an uppercase letter
+        words = line.split()
+        if len(words) < 1:
+            continue
+        if all(w[0].isupper() for w in words if w):
+            name = line
+            break
+
+    return name, email, phone
 
 
 def _extract_skills(text: str, skill_keywords: dict[str, list[str]]) -> list[str]:
@@ -232,12 +315,54 @@ def _detect_red_flags(
     return flags
 
 
+# ---------------------------------------------------------------------------
+# Must-have / nice-to-have weighted skill score
+# ---------------------------------------------------------------------------
+
+_MUST_HAVE_PENALTY = 0.15   # penalty per missing must-have skill
+_NICE_TO_HAVE_PENALTY = 0.05  # penalty per missing nice-to-have skill
+
+
+def _compute_skill_score(
+    skills_found: list[str],
+    skills_missing: list[str],
+    jd_skills: list[str],
+    jd_summary: "JDSummary | None" = None,
+) -> float:
+    """
+    Compute a weighted skill coverage score.
+
+    Without JDSummary: simple fraction = found / total
+    With JDSummary:
+      - Start at base fraction
+      - Apply extra penalty for each missing must-have skill
+      - Apply smaller penalty for each missing nice-to-have skill
+    """
+    if not jd_skills:
+        return 0.0
+
+    base = len(skills_found) / len(jd_skills)
+
+    if jd_summary is None:
+        return float(np.clip(base, 0.0, 1.0))
+
+    penalty = 0.0
+    for skill in skills_missing:
+        if skill in jd_summary.must_have:
+            penalty += _MUST_HAVE_PENALTY
+        elif skill in jd_summary.nice_to_have:
+            penalty += _NICE_TO_HAVE_PENALTY
+
+    return float(np.clip(base - penalty, 0.0, 1.0))
+
+
 def analyze_cv(
     filename: str,
     cv_text: str,
     jd_embedding: np.ndarray,
     jd_skills: list[str],
     k_evidence: int = TOP_K_EVIDENCE,
+    jd_summary: "JDSummary | None" = None,
 ) -> CVResult:
     """
     Analyse a single CV against the job description embedding.
@@ -247,30 +372,46 @@ def analyze_cv(
     score = WEIGHT_SEMANTIC * semantic_score + WEIGHT_SKILL * skill_score
 
     semantic_score    = mean of top-3 chunk cosine similarities
-    skill_score       = len(skills_found) / len(jd_skills)  (0 if no JD skills)
+    skill_score       = weighted skill coverage using must_have/nice_to_have
     experience_score  = min(1.0, experience_years / 5.0)   (stored, used by UI)
 
     Parameters
     ----------
-    filename      : str         original file name
-    cv_text       : str         raw extracted text of the CV
-    jd_embedding  : np.ndarray  embedding of the full JD text (1-D, normalised)
-    jd_skills     : list[str]   skills detected in the JD
-    k_evidence    : int         number of evidence chunks to return
+    filename      : str          original file name
+    cv_text       : str          raw extracted text of the CV
+    jd_embedding  : np.ndarray   embedding of the full JD text (1-D, normalised)
+    jd_skills     : list[str]    skills detected in the JD
+    k_evidence    : int          number of evidence chunks to return
+    jd_summary    : JDSummary    optional parsed JD with must_have/nice_to_have lists
 
     Returns
     -------
     CVResult
     """
+    from modules.cv_section_parser import parse_cv_sections
+
+    # --- parse CV sections ---
+    cv_sections = parse_cv_sections(cv_text)
+    job_hopping = cv_sections.job_hopping
+    job_count = cv_sections.job_count
+
+    # Text to use for experience and skill scoring (section-aware)
+    exp_text = cv_sections.experience_text or cv_text
+    skills_text = (
+        "\n\n".join(t for t in (cv_sections.skills_text, cv_sections.projects_text) if t)
+        or cv_text
+    )
+
     # --- chunk & embed CV ---
     chunks = chunk_text(cv_text)
     if not chunks:
-        exp_years = _extract_experience_years(cv_text)
-        exp_score = min(1.0, exp_years / 5.0)
+        exp_years = _extract_experience_years(exp_text)
+        exp_score = min(1.0, exp_years / EXPERIENCE_NORMALIZATION_YEARS)
         has_proj = _check_has_projects(cv_text)
         tags = _generate_tags([], jd_skills, exp_years, has_proj, cv_text)
         red_flags = _detect_red_flags(cv_text, exp_years, has_proj)
         summary = _build_summary(filename, [], jd_skills, 0.0, 0.0, exp_years)
+        candidate_name, email, phone = extract_contact_info(cv_text)
         return CVResult(
             filename=filename,
             full_text=cv_text,
@@ -287,6 +428,13 @@ def analyze_cv(
             has_projects=has_proj,
             tags=tags,
             red_flags=red_flags,
+            candidate_name=candidate_name,
+            email=email,
+            phone=phone,
+            must_have_missing=list(jd_summary.must_have) if jd_summary else [],
+            nice_to_have_missing=list(jd_summary.nice_to_have) if jd_summary else [],
+            job_hopping=job_hopping,
+            job_count=job_count,
         )
 
     chunk_embeddings = encode(chunks)
@@ -300,19 +448,31 @@ def analyze_cv(
     # --- evidence ---
     evidence = top_k_chunks(jd_embedding, chunk_embeddings, chunks, k=k_evidence)
 
-    # --- skill detection ---
-    cv_skills = _extract_skills(cv_text, SKILL_KEYWORDS)
-    skills_found = [s for s in cv_skills if s in jd_skills]
-    skills_missing = [s for s in jd_skills if s not in cv_skills]
+    # --- skill detection (section-aware) ---
+    cv_skills_all = _extract_skills(cv_text, SKILL_KEYWORDS)
+    cv_skills_skills_section = _extract_skills(skills_text, SKILL_KEYWORDS)
+    # Use full-text for "skills_found" so we don't miss skills mentioned in experience text,
+    # but prefer skills_section for skill_score computation
+    skills_found = [s for s in cv_skills_all if s in jd_skills]
+    skills_missing = [s for s in jd_skills if s not in cv_skills_all]
 
-    # --- skill coverage score ---
-    if jd_skills:
-        skill_score = len(skills_found) / len(jd_skills)
-    else:
-        skill_score = 0.0
+    # --- skill coverage score with must_have / nice_to_have weighting ---
+    skill_score = _compute_skill_score(
+        skills_found=skills_found,
+        skills_missing=skills_missing,
+        jd_skills=jd_skills,
+        jd_summary=jd_summary,
+    )
 
-    # --- experience ---
-    experience_years = _extract_experience_years(cv_text)
+    # --- must-have / nice-to-have gap lists ---
+    must_have_missing: list[str] = []
+    nice_to_have_missing: list[str] = []
+    if jd_summary:
+        must_have_missing = [s for s in jd_summary.must_have if s in skills_missing]
+        nice_to_have_missing = [s for s in jd_summary.nice_to_have if s in skills_missing]
+
+    # --- experience (from experience section text) ---
+    experience_years = _extract_experience_years(exp_text)
     experience_score = min(1.0, experience_years / EXPERIENCE_NORMALIZATION_YEARS)
 
     # --- project detection ---
@@ -330,8 +490,13 @@ def analyze_cv(
     # --- tags & red flags ---
     tags = _generate_tags(skills_found, skills_missing, experience_years, has_projects, cv_text)
     red_flags = _detect_red_flags(cv_text, experience_years, has_projects)
+    if job_hopping:
+        red_flags.append(f"Job hopping: ~{job_count} vị trí (có thể không ổn định)")
 
     summary = _build_summary(filename, skills_found, skills_missing, semantic_score, skill_score, experience_years)
+
+    # --- contact info ---
+    candidate_name, email, phone = extract_contact_info(cv_text)
 
     return CVResult(
         filename=filename,
@@ -349,6 +514,13 @@ def analyze_cv(
         has_projects=has_projects,
         tags=tags,
         red_flags=red_flags,
+        candidate_name=candidate_name,
+        email=email,
+        phone=phone,
+        must_have_missing=must_have_missing,
+        nice_to_have_missing=nice_to_have_missing,
+        job_hopping=job_hopping,
+        job_count=job_count,
     )
 
 
