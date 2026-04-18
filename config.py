@@ -9,8 +9,17 @@ APP_DESCRIPTION = (
 )
 
 # Multilingual model: supports 50+ languages (Vietnamese + English cross-lingual)
-# ~470 MB, runs on CPU, no API key needed
-EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+# Options (all free, local, no API key):
+#   "paraphrase-multilingual-MiniLM-L12-v2"       – ~470 MB, 384-dim (original default)
+#   "paraphrase-multilingual-mpnet-base-v2"        – ~278 MB, 768-dim, better quality ✅ recommended
+#   "sentence-transformers/LaBSE"                  – ~500 MB, 768-dim, excellent Vietnamese
+#   "intfloat/multilingual-e5-large"               – ~1.1 GB, 1024-dim, best quality (requires prompts)
+EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
+
+# Cross-encoder model for evidence re-ranking (free, local, ~85 MB).
+# Set to "" to disable cross-encoder re-ranking and rely on bi-encoder only.
+# Recommended: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # How many text chunks to show as evidence per CV
 TOP_K_EVIDENCE = 3

@@ -540,6 +540,7 @@ def analyze_cv(
     jd_skills: list[str],
     k_evidence: int = TOP_K_EVIDENCE,
     jd_summary: "JDSummary | None" = None,
+    jd_text: str = "",
 ) -> CVResult:
     """
     Analyse a single CV against the job description embedding.
@@ -560,6 +561,7 @@ def analyze_cv(
     jd_skills     : list[str]    skills detected in the JD
     k_evidence    : int          number of evidence chunks to return
     jd_summary    : JDSummary    optional parsed JD with must_have/nice_to_have lists
+    jd_text       : str          raw JD text used by cross-encoder re-ranking
 
     Returns
     -------
@@ -623,8 +625,11 @@ def analyze_cv(
     top_scores = np.sort(raw_scores)[::-1][:k_for_score]
     semantic_score = float(np.clip(np.mean(top_scores), 0.0, 1.0))
 
-    # --- evidence ---
-    evidence = top_k_chunks(jd_embedding, chunk_embeddings, chunks, k=k_evidence)
+    # --- evidence (with optional cross-encoder re-ranking) ---
+    evidence = top_k_chunks(
+        jd_embedding, chunk_embeddings, chunks,
+        k=k_evidence, query_text=jd_text,
+    )
 
     # --- skill detection (section-aware) ---
     cv_skills_all = _extract_skills(cv_text, SKILL_KEYWORDS)

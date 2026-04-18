@@ -30,17 +30,21 @@ if TYPE_CHECKING:
 # Config
 # ---------------------------------------------------------------------------
 
-SUPPORTED_PROVIDERS = ("openai", "gemini", "groq")
+SUPPORTED_PROVIDERS = ("openai", "gemini", "groq", "ollama")
 
 
 @dataclass
 class LLMConfig:
     """LLM provider settings — never stored in DB."""
-    provider: str = "openai"       # "openai" | "gemini" | "groq"
+    provider: str = "openai"       # "openai" | "gemini" | "groq" | "ollama"
     api_key: str = ""
     model: str = ""                # leave empty to use provider default
+    ollama_base_url: str = "http://localhost:11434"  # Ollama server URL
 
     def is_configured(self) -> bool:
+        # Ollama does not require an API key — just needs a model name
+        if self.provider == "ollama":
+            return True
         return bool(self.api_key.strip())
 
 
@@ -68,6 +72,7 @@ _DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "gemini": "gemini-1.5-flash",
     "groq":   "llama3-8b-8192",
+    "ollama": "qwen2.5:7b",
 }
 
 # ---------------------------------------------------------------------------
@@ -206,6 +211,50 @@ def _call_groq(config: LLMConfig, user_prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
+def _call_ollama(config: LLMConfig, user_prompt: str) -> str:
+    """Call Ollama local API (completely free, no API key required).
+
+    Requires Ollama running locally:
+        https://ollama.com/download
+    Then pull a model:
+        ollama pull qwen2.5:7b
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    base_url = (config.ollama_base_url or "http://localhost:11434").rstrip("/")
+    model = config.model or _DEFAULT_MODELS["ollama"]
+
+    payload = _json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.3},
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = _json.loads(resp.read().decode())
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Không kết nối được Ollama tại {base_url}. "
+            "Hãy chắc chắn Ollama đang chạy: https://ollama.com/download"
+        ) from exc
+
+    # Ollama /api/chat response: {"message": {"role": "assistant", "content": "..."}}
+    return data.get("message", {}).get("content", "")
+
+
 # ---------------------------------------------------------------------------
 # JSON extraction / parsing
 # ---------------------------------------------------------------------------
@@ -272,6 +321,8 @@ def generate_llm_summary(
             raw = _call_gemini(config, user_prompt)
         elif config.provider == "groq":
             raw = _call_groq(config, user_prompt)
+        elif config.provider == "ollama":
+            raw = _call_ollama(config, user_prompt)
         else:
             return fallback
     except Exception as exc:
@@ -386,6 +437,11 @@ def generate_comparison_summary(
                 max_tokens=300,
             )
             return resp.choices[0].message.content or ""
+        elif config.provider == "ollama":
+            return _call_ollama(
+                LLMConfig(provider="ollama", model=config.model, ollama_base_url=config.ollama_base_url),
+                prompt,
+            )
     except Exception as exc:
         return f"[Lỗi so sánh: {exc}]"
     return ""
@@ -444,6 +500,11 @@ def extract_jd_skills_llm(
                 max_tokens=400,
             )
             raw = resp.choices[0].message.content or ""
+        elif config.provider == "ollama":
+            raw = _call_ollama(
+                LLMConfig(provider="ollama", model=config.model, ollama_base_url=config.ollama_base_url),
+                prompt,
+            )
     except Exception:
         return [], []
 
@@ -512,6 +573,11 @@ def parse_cv_sections_llm(
                 max_tokens=900,
             )
             raw = resp.choices[0].message.content or ""
+        elif config.provider == "ollama":
+            raw = _call_ollama(
+                LLMConfig(provider="ollama", model=config.model, ollama_base_url=config.ollama_base_url),
+                prompt,
+            )
     except Exception:
         return {}
 

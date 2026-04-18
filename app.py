@@ -239,13 +239,71 @@ def render_sidebar():
             if llm_enabled:
                 llm_provider = st.selectbox(
                     "Provider",
-                    options=["groq", "openai", "gemini"],
+                    options=["ollama", "groq", "openai", "gemini"],
                     key="llm_provider",
                 )
 
                 # When Groq key is from env, show a read-only indicator instead of text input
-                current_provider = st.session_state.get("llm_provider", "groq")
-                if current_provider == "groq" and _ENV_GROQ_KEY:
+                current_provider = st.session_state.get("llm_provider", "ollama")
+                if current_provider == "ollama":
+                    st.success(
+                        "🆓 **Ollama – Hoàn toàn miễn phí, chạy trên máy bạn!**\n\n"
+                        "Không cần API key, không gửi dữ liệu ra ngoài."
+                    )
+                    llm_model = st.text_input(
+                        "Model (để trống = mặc định qwen2.5:7b)",
+                        placeholder="qwen2.5:7b / llama3.1:8b / mistral:7b",
+                        key="llm_model",
+                    )
+                    ollama_url = st.text_input(
+                        "Ollama URL",
+                        value="http://localhost:11434",
+                        key="ollama_base_url",
+                    )
+                    with st.expander("📖 Hướng dẫn cài Ollama", expanded=False):
+                        st.markdown(
+                            "**Bước 1:** Tải và cài Ollama tại "
+                            "[ollama.com/download](https://ollama.com/download)\n\n"
+                            "**Bước 2:** Mở terminal và tải model:\n"
+                            "```bash\n"
+                            "ollama pull qwen2.5:7b\n"
+                            "```\n"
+                            "*(hoặc `llama3.1:8b`, `mistral:7b`)*\n\n"
+                            "**Bước 3:** Ollama tự động chạy nền — bật toggle và phân tích CV!"
+                        )
+                    # Store a dummy key so is_configured() returns True for Ollama
+                    st.session_state.setdefault("llm_api_key", "__ollama__")
+                    # ---- Ollama connectivity check ----
+                    col_ollama, col_ollama_btn = st.columns([3, 1])
+                    with col_ollama_btn:
+                        _ollama_test = st.button("🔄 Kiểm tra", key="ollama_test_btn")
+                    if _ollama_test:
+                        _ollama_url = st.session_state.get("ollama_base_url", "http://localhost:11434")
+                        _ollama_model = st.session_state.get("llm_model", "") or "qwen2.5:7b"
+                        try:
+                            import json as _json_t
+                            import urllib.request as _urlreq
+                            _payload = _json_t.dumps({
+                                "model": _ollama_model,
+                                "messages": [{"role": "user", "content": "Hi"}],
+                                "stream": False,
+                            }).encode()
+                            _req = _urlreq.Request(
+                                f"{_ollama_url.rstrip('/')}/api/chat",
+                                data=_payload,
+                                headers={"Content-Type": "application/json"},
+                                method="POST",
+                            )
+                            with _urlreq.urlopen(_req, timeout=15) as _resp:
+                                _reply = _json_t.loads(_resp.read().decode())
+                            _content = _reply.get("message", {}).get("content", "").strip()[:60]
+                            st.success(f"✅ **Ollama hoạt động** — Model: `{_ollama_model}` · Phản hồi: \"{_content}\"")
+                        except Exception as _exc:
+                            st.error(
+                                f"❌ **Không kết nối được Ollama**\n\n```\n{_exc}\n```\n\n"
+                                "Hãy chắc Ollama đang chạy và model đã được pull."
+                            )
+                elif current_provider == "groq" and _ENV_GROQ_KEY:
                     st.info("🔑 API key được nạp tự động từ biến môi trường `GROQ_API_KEY`.")
                     # Keep the session key populated but don't expose in UI
                     st.session_state.setdefault("llm_api_key", _ENV_GROQ_KEY)
@@ -327,10 +385,11 @@ def render_sidebar():
 
         # Technical info in expander (hidden by default)
         with st.expander("⚙️ Thông tin kỹ thuật", expanded=False):
-            st.markdown("**Embedding AI:** `paraphrase-multilingual-MiniLM-L12-v2`")
-            st.markdown("**LLM:** Groq (miễn phí) / OpenAI / Gemini")
+            st.markdown("**Embedding AI:** `paraphrase-multilingual-mpnet-base-v2` (768-dim, tốt hơn MiniLM)")
+            st.markdown("**Re-ranking:** `cross-encoder/ms-marco-MiniLM-L-6-v2` (tự động)")
+            st.markdown("**LLM:** Ollama (miễn phí, local) / Groq / OpenAI / Gemini")
             st.markdown("**Ngôn ngữ:** Tiếng Việt + Tiếng Anh (cross-lingual)")
-            st.markdown("**Phương pháp:** Semantic embeddings + Skill coverage + LLM analysis")
+            st.markdown("**Phương pháp:** Semantic embeddings + Cross-encoder re-ranking + Skill coverage + LLM analysis")
             st.markdown("**PDF hỗ trợ:** pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract)")
             st.markdown("**DOCX hỗ trợ:** python-docx (paragraphs + tables)")
 
@@ -539,9 +598,10 @@ def _get_llm_config() -> LLMConfig:
     if not st.session_state.get("llm_enabled", False):
         return LLMConfig()
     return LLMConfig(
-        provider=st.session_state.get("llm_provider", "groq"),
+        provider=st.session_state.get("llm_provider", "ollama"),
         api_key=st.session_state.get("llm_api_key", ""),
         model=st.session_state.get("llm_model", ""),
+        ollama_base_url=st.session_state.get("ollama_base_url", "http://localhost:11434"),
     )
 
 
@@ -1149,6 +1209,7 @@ def render_analysis_tab():
                     jd_embedding=jd_embedding,
                     jd_skills=jd_skills,
                     jd_summary=jd_summary,
+                    jd_text=jd_text,
                 )
 
                 # AI section parsing fallback: enrich experience when regex failed
