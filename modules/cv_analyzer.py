@@ -62,6 +62,12 @@ class CVResult:
     # ---- job-hopping (new) ----
     job_hopping: bool = False            # detected from experience section
     job_count: int = 0                   # estimated number of distinct positions
+    # ---- experience source ----
+    experience_source: str = ""          # "stated" | "inferred_from_dates" | ""
+    # ---- LLM-enriched fields ----
+    ats_score: float = 0.0               # ATS keyword score (0-100) from LLM
+    potential_level: str = ""            # "High" | "Medium" | "Low" from LLM
+    culture_fit: str = ""                # culture fit note from LLM
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +219,173 @@ _PROJECT_KEYWORDS: list[str] = [
     "phát triển", "xây", "làm dự án",
 ]
 
+# Month name → number mapping (English abbreviations + full)
+_MONTH_MAP: dict[str, int] = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2,
+    "mar": 3, "march": 3, "apr": 4, "april": 4,
+    "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
 
-def _extract_experience_years(text: str) -> int:
-    """Extract maximum stated years of experience from CV text."""
+# Named month alternation (used in both _DATE_ENDPOINT_RE and _DR)
+_MONTH_NAMES_RE = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
+    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+
+# Patterns for a single date endpoint: MM/YYYY, YYYY, Mon YYYY, tháng N/YYYY
+# Note: use [ \t]+ (horizontal space only) for Mon YYYY to prevent cross-line matches.
+_DATE_ENDPOINT_RE = re.compile(
+    r"(?:"
+    r"(?:tháng\s*(\d{1,2})[,/\s]+)(\d{4})"             # tháng N/YYYY or tháng N YYYY
+    r"|(\d{1,2})[/\-](\d{4})"                            # MM/YYYY or MM-YYYY
+    r"|(" + _MONTH_NAMES_RE + r")\.?[ \t]+(\d{4})"      # Mon YYYY  (Jan 2019)
+    r"|(\d{4})"                                           # bare YYYY
+    r")",
+    re.IGNORECASE,
+)
+
+# Separator between two date endpoints (dash only — slash is used inside dates like MM/YYYY)
+_DATE_SEP_RE = re.compile(r"\s*[-–—]\s*")
+
+# "present / now / hiện tại / hiện nay / current"
+_PRESENT_RE = re.compile(r"\b(present|now|current|hiện\s*(?:tại|nay))\b", re.IGNORECASE)
+
+# Single date-endpoint fragment used in the date-range regex below.
+# Matches: tháng N/YYYY  |  MM/YYYY  |  Jan 2019  |  2019
+_DATE_PART_PAT = (
+    r"(?:tháng\s*\d{1,2}[,/\s]+\d{4}"
+    r"|\d{1,2}[/\-]\d{4}"
+    r"|" + _MONTH_NAMES_RE + r"\.?[ \t]+\d{4}"
+    r"|\d{4})"
+)
+
+# Full date-range regex: <date> – <date|present>.
+# Named-month alternation (not generic [a-zA-Z]+) and horizontal whitespace in the
+# month-year form prevent cross-line false matches like "engineer\n2023".
+_DATE_RANGE_FULL_RE = re.compile(
+    _DATE_PART_PAT
+    + r"\s*[-–—]\s*"
+    + r"(?:present|now|current|hiện\s*(?:tại|nay)|" + _DATE_PART_PAT + r")",
+    re.IGNORECASE,
+)
+
+
+def _parse_date_endpoint(text: str) -> tuple[int, int] | None:
+    """
+    Parse a single date string into (year, month).
+    Returns None if unparseable.
+    """
+    text = text.strip()
+    m = _DATE_ENDPOINT_RE.match(text)
+    if not m:
+        return None
+    # tháng N/YYYY
+    if m.group(1) and m.group(2):
+        return int(m.group(2)), int(m.group(1))
+    # MM/YYYY
+    if m.group(3) and m.group(4):
+        mon, yr = int(m.group(3)), int(m.group(4))
+        if 1 <= mon <= 12:
+            return yr, mon
+        return None
+    # Mon YYYY (named month)
+    if m.group(5) and m.group(6):
+        mon_str = m.group(5).lower().rstrip(".")
+        mon = _MONTH_MAP.get(mon_str)
+        if mon:
+            return int(m.group(6)), mon
+        return None
+    # bare YYYY
+    if m.group(7):
+        return int(m.group(7)), 1
+    return None
+
+
+def _abs_month(year: int, month: int) -> int:
+    """Convert (year, month) to an absolute month index for arithmetic."""
+    return year * 12 + month
+
+
+def _infer_experience_from_date_ranges(text: str) -> int:
+    """
+    Infer total years of work experience by parsing date ranges from *text*.
+
+    Algorithm
+    ---------
+    1. Find all date-range patterns (start – end / start – present).
+    2. Convert each to (abs_start_month, abs_end_month).
+    3. Merge overlapping / adjacent intervals.
+    4. Sum total months across merged intervals.
+    5. Return floor(total_months / 12).
+
+    Returns 0 if no valid date ranges are found.
+    """
+    import datetime
+    now = datetime.date.today()
+    now_abs = _abs_month(now.year, now.month)
+
+    intervals: list[tuple[int, int]] = []
+    for match in _DATE_RANGE_FULL_RE.finditer(text):
+        span_text = match.group(0)
+        # Split at the separator
+        sep_m = _DATE_SEP_RE.search(span_text)
+        if not sep_m:
+            continue
+        start_str = span_text[: sep_m.start()]
+        end_str = span_text[sep_m.end():]
+
+        start_ep = _parse_date_endpoint(start_str)
+        if start_ep is None:
+            continue
+        start_abs = _abs_month(*start_ep)
+
+        if _PRESENT_RE.match(end_str.strip()):
+            end_abs = now_abs
+        else:
+            end_ep = _parse_date_endpoint(end_str)
+            if end_ep is None:
+                continue
+            end_abs = _abs_month(*end_ep)
+
+        if end_abs < start_abs:
+            continue  # malformed range
+        intervals.append((start_abs, end_abs))
+
+    if not intervals:
+        return 0
+
+    # Merge overlapping or adjacent intervals.
+    # We treat intervals 1 month apart as adjacent (e.g. a job ending in Dec 2022
+    # and the next starting in Jan 2023) to avoid gaps from imprecise date rounding.
+    intervals.sort()
+    merged: list[tuple[int, int]] = []
+    cur_start, cur_end = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= cur_end + 1:  # overlapping or adjacent (within 1 month)
+            cur_end = max(cur_end, e)
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = s, e
+    merged.append((cur_start, cur_end))
+
+    total_months = sum(e - s for s, e in merged)
+    return max(0, total_months // 12)
+
+
+def _extract_experience_years(text: str) -> tuple[int, str]:
+    """
+    Extract years of experience from *text*.
+
+    Returns
+    -------
+    tuple[int, str]
+        (years, source) where source is "stated" or "inferred_from_dates".
+        years == 0 means not found by either method.
+    """
     max_years = 0
     for pat in _CV_EXP_PATTERNS:
         for m in re.finditer(pat, text, re.IGNORECASE):
@@ -225,7 +395,14 @@ def _extract_experience_years(text: str) -> int:
                     max_years = max(max_years, y)
             except (ValueError, IndexError):
                 pass
-    return max_years
+    if max_years > 0:
+        return max_years, "stated"
+
+    inferred = _infer_experience_from_date_ranges(text)
+    if inferred > 0:
+        return min(inferred, MAX_EXPERIENCE_YEARS), "inferred_from_dates"
+
+    return 0, ""
 
 
 def _check_has_projects(text: str) -> bool:
@@ -405,7 +582,7 @@ def analyze_cv(
     # --- chunk & embed CV ---
     chunks = chunk_text(cv_text)
     if not chunks:
-        exp_years = _extract_experience_years(exp_text)
+        exp_years, exp_source = _extract_experience_years(exp_text)
         exp_score = min(1.0, exp_years / EXPERIENCE_NORMALIZATION_YEARS)
         has_proj = _check_has_projects(cv_text)
         tags = _generate_tags([], jd_skills, exp_years, has_proj, cv_text)
@@ -435,6 +612,7 @@ def analyze_cv(
             nice_to_have_missing=list(jd_summary.nice_to_have) if jd_summary else [],
             job_hopping=job_hopping,
             job_count=job_count,
+            experience_source=exp_source,
         )
 
     chunk_embeddings = encode(chunks)
@@ -472,7 +650,7 @@ def analyze_cv(
         nice_to_have_missing = [s for s in jd_summary.nice_to_have if s in skills_missing]
 
     # --- experience (from experience section text) ---
-    experience_years = _extract_experience_years(exp_text)
+    experience_years, experience_source = _extract_experience_years(exp_text)
     experience_score = min(1.0, experience_years / EXPERIENCE_NORMALIZATION_YEARS)
 
     # --- project detection ---
@@ -521,6 +699,7 @@ def analyze_cv(
         nice_to_have_missing=nice_to_have_missing,
         job_hopping=job_hopping,
         job_count=job_count,
+        experience_source=experience_source,
     )
 
 

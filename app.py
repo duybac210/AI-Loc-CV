@@ -40,7 +40,7 @@ from modules.database_manager import (
 from modules.embedding_manager import encode, get_model
 from modules.export_manager import results_to_dataframe, to_csv_bytes, to_excel_bytes, to_pdf_bytes
 from modules.jd_parser import JDSummary, parse_jd
-from modules.llm_analyzer import LLMConfig, generate_llm_summary, SUPPORTED_PROVIDERS
+from modules.llm_analyzer import LLMConfig, LLMResult, generate_llm_summary, SUPPORTED_PROVIDERS
 from modules.pdf_processor import extract_text_from_pdf, extract_text_from_docx, OCR_PREFIX
 
 # ---------------------------------------------------------------------------
@@ -491,10 +491,17 @@ def _render_candidate_cards(
             sc2.progress(result.semantic_score)
             sc3.metric("Kỹ năng", f"{round(result.skill_score * 100, 1)}%")
             sc3.progress(result.skill_score)
-            sc4.metric(
-                "Kinh nghiệm",
-                f"{result.experience_years} năm" if result.experience_years else "—",
-            )
+            if result.experience_years:
+                _src = result.experience_source
+                _src_label = {
+                    "stated": "tự khai",
+                    "inferred_from_dates": "suy ra từ ngày tháng",
+                }.get(_src, "")
+                _exp_label = f"{result.experience_years} năm"
+                _exp_delta = _src_label or None
+                sc4.metric("Kinh nghiệm", _exp_label, delta=_exp_delta, delta_color="off")
+            else:
+                sc4.metric("Kinh nghiệm", "⚠️ Không xác định")
 
             # Must-have / nice-to-have gap
             if result.must_have_missing or result.nice_to_have_missing:
@@ -540,18 +547,38 @@ def _render_candidate_cards(
             # LLM-enhanced summary
             summary_key = f"llm_summary_{result.filename}_{rank}"
             questions_key = f"llm_questions_{result.filename}_{rank}"
+            llm_result_key = f"llm_result_{result.filename}_{rank}"
 
             if llm_config.is_configured():
                 if summary_key not in st.session_state:
                     with st.spinner("✨ AI đang tạo nhận xét..."):
-                        llm_sum, llm_questions, llm_decision = generate_llm_summary(
+                        llm_res: LLMResult = generate_llm_summary(
                             llm_config, result.full_text, jd_text, result
                         )
-                    st.session_state[summary_key] = llm_sum
-                    st.session_state[questions_key] = llm_questions
-                    if llm_decision and not current_decision:
-                        st.session_state[decision_state_key] = llm_decision
+                    st.session_state[summary_key] = llm_res.summary
+                    st.session_state[questions_key] = llm_res.interview_questions
+                    st.session_state[llm_result_key] = llm_res
+                    if llm_res.decision and not current_decision:
+                        st.session_state[decision_state_key] = llm_res.decision
                 st.info(f"✨ **Nhận xét AI nâng cao:** {st.session_state[summary_key]}")
+
+                # Extended LLM scores
+                cached_llm: LLMResult | None = st.session_state.get(llm_result_key)
+                if cached_llm:
+                    llm_col1, llm_col2, llm_col3, llm_col4 = st.columns(4)
+                    if cached_llm.skill_match:
+                        llm_col1.metric("🎯 Kỹ năng (AI)", f"{round(cached_llm.skill_match)}%")
+                    if cached_llm.experience_match:
+                        llm_col2.metric("📅 KN match (AI)", f"{round(cached_llm.experience_match)}%")
+                    if cached_llm.ats_score:
+                        llm_col3.metric("🔑 ATS Score", f"{round(cached_llm.ats_score)}%")
+                    if cached_llm.potential_level:
+                        llm_col4.metric("🚀 Tiềm năng", cached_llm.potential_level)
+                    if cached_llm.stability:
+                        st.caption(f"📊 Ổn định: {cached_llm.stability}")
+                    if cached_llm.culture_fit:
+                        st.caption(f"🏢 Văn hóa: {cached_llm.culture_fit}")
+
                 questions = st.session_state.get(questions_key, [])
                 if questions:
                     with st.expander("💬 Gợi ý câu hỏi phỏng vấn (AI)", expanded=False):
@@ -615,7 +642,7 @@ def _render_candidate_cards(
                 ):
                     sc1, sc2, sc3 = st.columns(3)
                     sc1.metric("Điểm", f"{pct}%")
-                    sc2.metric("KN", f"{result.experience_years} năm" if result.experience_years else "—")
+                    sc2.metric("Kinh nghiệm", f"{result.experience_years} năm" if result.experience_years else "⚠️ Không xác định")
                     sc3.metric("Kỹ năng có", str(len(result.skills_found)))
                     if result.skills_found:
                         st.markdown("**Kỹ năng có:** " + ", ".join(result.skills_found))
@@ -1144,7 +1171,7 @@ def _render_shortlist_tab(
             "Email": result.email or "—",
             "SĐT": result.phone or "—",
             "Điểm (%)": round(score * 100, 1),
-            "Kinh nghiệm": f"{result.experience_years} năm" if result.experience_years else "—",
+            "Kinh nghiệm": f"{result.experience_years} năm" if result.experience_years else "⚠️ Không xác định",
             "Kỹ năng có": ", ".join(result.skills_found[:5]) or "—",
             "Thiếu must-have": ", ".join(result.must_have_missing) or "—",
         })
