@@ -172,9 +172,11 @@ def _extract_ocr(raw: bytes) -> str:
 
 def extract_text_from_docx(source: Union[bytes, str]) -> str:
     """
-    Extract all text from a DOCX (or DOC) file.
+    Extract all text from a DOCX file.
 
     Reads paragraphs and table cells using python-docx.
+    Note: Only the modern DOCX format (.docx) is supported.
+    Legacy binary DOC files (.doc) are not supported by python-docx.
 
     Parameters
     ----------

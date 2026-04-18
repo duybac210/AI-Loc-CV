@@ -684,7 +684,7 @@ def _render_radar_chart(
 
     fig_radar = go.Figure()
     for r, s in chosen_pairs:
-        exp_norm = min(100.0, r.experience_years / 5.0 * 100)
+        exp_norm = min(100.0, (r.experience_years or 0) / 5.0 * 100)
         project_score = 100.0 if r.has_projects else 0.0
         values = [
             round(s * 100, 1),
