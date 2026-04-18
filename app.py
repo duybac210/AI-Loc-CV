@@ -35,10 +35,12 @@ from modules.database_manager import (
     init_db,
     list_sessions,
     save_session,
+    update_decision,
 )
 from modules.embedding_manager import encode, get_model
 from modules.export_manager import results_to_dataframe, to_csv_bytes, to_excel_bytes
 from modules.jd_parser import JDSummary, parse_jd
+from modules.llm_analyzer import LLMConfig, generate_llm_summary, SUPPORTED_PROVIDERS
 from modules.pdf_processor import extract_text_from_pdf, OCR_PREFIX
 
 # ---------------------------------------------------------------------------
@@ -46,7 +48,6 @@ from modules.pdf_processor import extract_text_from_pdf, OCR_PREFIX
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, layout="wide")
 init_db()
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -145,43 +146,70 @@ def render_sidebar():
         st.markdown("### ⚖️ Trọng số chấm điểm")
         st.caption("Điều chỉnh mức độ ưu tiên của từng tiêu chí (tự động chuẩn hóa)")
         w_sem = st.slider(
-            "🧠 Ngữ nghĩa (Semantic)", 0, 100,
+            "Ngữ nghĩa (Semantic)", 0, 100,
             int(WEIGHT_SEMANTIC * 100), 5, key="w_semantic",
         )
         w_sk = st.slider(
-            "🔧 Kỹ năng (Skill coverage)", 0, 100,
+            "Kỹ năng (Skill coverage)", 0, 100,
             int(WEIGHT_SKILL * 100), 5, key="w_skill",
         )
         w_exp = st.slider(
-            "📅 Kinh nghiệm (Experience)", 0, 100,
+            "Kinh nghiệm (Experience)", 0, 100,
             int(WEIGHT_EXPERIENCE * 100), 5, key="w_experience",
         )
         total_w = max(w_sem + w_sk + w_exp, 1)
         st.caption(
-            f"**Phân bổ thực tế:** "
+            f"**Phân bổ:** "
             f"Ngữ nghĩa {round(w_sem/total_w*100)}% · "
             f"Kỹ năng {round(w_sk/total_w*100)}% · "
             f"Kinh nghiệm {round(w_exp/total_w*100)}%"
         )
         st.divider()
 
+        # LLM settings
+        st.markdown("### ✨ AI nâng cao (LLM)")
+        st.caption("Tạo nhận xét tự nhiên + gợi ý câu hỏi phỏng vấn")
+        llm_enabled = st.toggle("Bật AI nâng cao", value=False, key="llm_enabled")
+        if llm_enabled:
+            llm_provider = st.selectbox(
+                "Provider",
+                options=list(SUPPORTED_PROVIDERS),
+                key="llm_provider",
+            )
+            llm_api_key = st.text_input(
+                "API Key",
+                type="password",
+                placeholder="sk-... / AIza... / gsk_...",
+                key="llm_api_key",
+            )
+            llm_model = st.text_input(
+                "Model (để trống = mặc định)",
+                placeholder="gpt-4o-mini / gemini-1.5-flash / llama3-8b-8192",
+                key="llm_model",
+            )
+            if not llm_api_key:
+                st.caption("ℹ️ Nhập API key để kích hoạt. Key không được lưu vào database.")
+        st.divider()
+
         st.markdown("### Hướng dẫn sử dụng")
         st.markdown(
             """
-1. Nhập **Mô tả công việc (JD)** – tiếng Việt hoặc tiếng Anh
+1. Nhập **Mô tả công việc (JD)**
 2. Xem **JD tóm tắt** & điều chỉnh **Bộ lọc**
 3. Upload một hoặc nhiều **CV dạng PDF**
 4. Nhấn **Phân tích CV**
-5. Xem kết quả xếp hạng, dashboard & tải xuống
-6. Vào tab **Lịch sử** để xem lại các lần chấm trước
+5. Xem kết quả, shortlist ứng viên & tải xuống
+6. Vào tab **Lịch sử** để xem lại
 """
         )
         st.divider()
-        st.markdown("**🤖 AI Engine:** `paraphrase-multilingual-MiniLM-L12-v2`")
-        st.markdown("**🌐 Ngôn ngữ:** Tiếng Việt + Tiếng Anh (cross-lingual)")
-        st.markdown("**📊 Phương pháp:** Semantic embeddings + Skill coverage + Experience")
-        st.divider()
-        st.markdown("**📄 PDF hỗ trợ:** pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract)")
+
+        # Technical info in expander (hidden by default)
+        with st.expander("⚙️ Thông tin kỹ thuật", expanded=False):
+            st.markdown("**AI Engine:** `paraphrase-multilingual-MiniLM-L12-v2`")
+            st.markdown("**Ngôn ngữ:** Tiếng Việt + Tiếng Anh (cross-lingual)")
+            st.markdown("**Phương pháp:** Semantic embeddings + Skill coverage + Experience")
+            st.markdown("**PDF hỗ trợ:** pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract)")
 
 
 # ---------------------------------------------------------------------------
@@ -383,11 +411,35 @@ def _render_insight_dashboard(
 # Candidate Cards
 # ---------------------------------------------------------------------------
 
+def _get_llm_config() -> LLMConfig:
+    """Build LLMConfig from current session state."""
+    if not st.session_state.get("llm_enabled", False):
+        return LLMConfig()
+    return LLMConfig(
+        provider=st.session_state.get("llm_provider", "openai"),
+        api_key=st.session_state.get("llm_api_key", ""),
+        model=st.session_state.get("llm_model", ""),
+    )
+
+
+def _decision_color(decision: str) -> str:
+    if decision == "Shortlist":
+        return "#27ae60"
+    if decision == "Consider":
+        return "#f39c12"
+    if decision == "Reject":
+        return "#e74c3c"
+    return "#95a5a6"
+
+
 def _render_candidate_cards(
     display_list: list[tuple[CVResult, float]],
     pre_filtered_out: list[tuple[CVResult, float, list[str]]],
+    jd_text: str = "",
 ) -> None:
     st.subheader("📋 Phân tích chi tiết ứng viên")
+
+    llm_config = _get_llm_config()
 
     # Show passing candidates
     for rank, (result, score) in enumerate(display_list, start=1):
@@ -401,35 +453,69 @@ def _render_candidate_cards(
                 _skill_badge(f"⚠️ {f}", "#c0392b") for f in result.red_flags
             )
 
-        header_html = (
-            f"#{rank} {result.filename} – {icon} {pct}%"
-        )
+        # Show decision badge in header if set
+        decision_state_key = f"decision_{result.filename}_{rank}"
+        current_decision = st.session_state.get(decision_state_key, "")
+        decision_badge = ""
+        if current_decision:
+            dcolor = _decision_color(current_decision)
+            decision_badge = f' <span style="background:{dcolor};color:white;padding:2px 8px;border-radius:10px;font-size:0.8em">{current_decision}</span>'
+
+        # Contact info in header
+        contact_str = ""
+        if result.candidate_name:
+            contact_str = f" — {result.candidate_name}"
+
+        header_html = f"#{rank}{contact_str} · {result.filename} – {icon} {pct}%{decision_badge}"
 
         with st.expander(header_html, expanded=(rank == 1)):
+            # Contact info row
+            if result.candidate_name or result.email or result.phone:
+                ci1, ci2, ci3 = st.columns(3)
+                ci1.markdown(f"**👤 Tên:** {result.candidate_name or '—'}")
+                ci2.markdown(f"**✉️ Email:** {result.email or '—'}")
+                ci3.markdown(f"**📞 SĐT:** {result.phone or '—'}")
+                st.markdown("")
+
             # Tags row
             if result.tags or result.red_flags:
                 st.markdown(tag_html + red_flag_html, unsafe_allow_html=True)
                 st.markdown("")
 
-            # Score breakdown
+            # Score breakdown with progress bars
             sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("🎯 Tổng điểm", f"{pct}%")
-            sc2.metric("🧠 Ngữ nghĩa", f"{round(result.semantic_score * 100, 1)}%")
-            sc3.metric("🔧 Kỹ năng", f"{round(result.skill_score * 100, 1)}%")
+            sc1.metric("Tổng điểm", f"{pct}%")
+            sc1.progress(score)
+            sc2.metric("Ngữ nghĩa", f"{round(result.semantic_score * 100, 1)}%")
+            sc2.progress(result.semantic_score)
+            sc3.metric("Kỹ năng", f"{round(result.skill_score * 100, 1)}%")
+            sc3.progress(result.skill_score)
             sc4.metric(
-                "📅 Kinh nghiệm",
+                "Kinh nghiệm",
                 f"{result.experience_years} năm" if result.experience_years else "—",
             )
 
+            # Must-have / nice-to-have gap
+            if result.must_have_missing or result.nice_to_have_missing:
+                gap_col1, gap_col2 = st.columns(2)
+                with gap_col1:
+                    if result.must_have_missing:
+                        badges = " ".join(_skill_badge(s, "#c0392b") for s in result.must_have_missing)
+                        st.markdown("**🔴 Thiếu must-have:** " + badges, unsafe_allow_html=True)
+                with gap_col2:
+                    if result.nice_to_have_missing:
+                        badges = " ".join(_skill_badge(s, "#d68910") for s in result.nice_to_have_missing)
+                        st.markdown("**🟡 Thiếu nice-to-have:** " + badges, unsafe_allow_html=True)
+
             # Structured explanation
-            st.markdown("**📝 Phân tích chi tiết:**")
+            st.markdown("**Phân tích chi tiết:**")
             exp_col, skill_col = st.columns(2)
             with exp_col:
                 st.markdown("**✅ Điểm mạnh:**")
                 if result.experience_years > 0:
-                    st.markdown(f"- 📅 {result.experience_years} năm kinh nghiệm")
+                    st.markdown(f"- {result.experience_years} năm kinh nghiệm")
                 if result.has_projects:
-                    st.markdown("- 🏗 Có dự án thực tế")
+                    st.markdown("- Có dự án thực tế")
                 if result.skills_found:
                     for skill in result.skills_found:
                         st.markdown(f"- ✔ {skill}")
@@ -450,11 +536,55 @@ def _render_candidate_cards(
                     + "\n".join(f"- {f}" for f in result.red_flags)
                 )
 
-            # AI summary
-            st.info(f"💡 **Nhận xét AI:** {result.summary}")
+            # LLM-enhanced summary
+            summary_key = f"llm_summary_{result.filename}_{rank}"
+            questions_key = f"llm_questions_{result.filename}_{rank}"
+
+            if llm_config.is_configured():
+                if summary_key not in st.session_state:
+                    with st.spinner("✨ AI đang tạo nhận xét..."):
+                        llm_sum, llm_questions, llm_decision = generate_llm_summary(
+                            llm_config, result.full_text, jd_text, result
+                        )
+                    st.session_state[summary_key] = llm_sum
+                    st.session_state[questions_key] = llm_questions
+                    if llm_decision and not current_decision:
+                        st.session_state[decision_state_key] = llm_decision
+                st.info(f"✨ **Nhận xét AI nâng cao:** {st.session_state[summary_key]}")
+                questions = st.session_state.get(questions_key, [])
+                if questions:
+                    with st.expander("💬 Gợi ý câu hỏi phỏng vấn (AI)", expanded=False):
+                        for i, q in enumerate(questions, 1):
+                            st.markdown(f"{i}. {q}")
+            else:
+                st.info(f"💡 **Nhận xét AI:** {result.summary}")
+
+            # HR Decision buttons
+            st.markdown("**Quyết định HR:**")
+            btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+            with btn_col1:
+                if st.button("✅ Shortlist", key=f"sl_{result.filename}_{rank}"):
+                    st.session_state[decision_state_key] = "Shortlist"
+                    st.rerun()
+            with btn_col2:
+                if st.button("⏸ Cân nhắc", key=f"cs_{result.filename}_{rank}"):
+                    st.session_state[decision_state_key] = "Consider"
+                    st.rerun()
+            with btn_col3:
+                if st.button("❌ Loại", key=f"rj_{result.filename}_{rank}"):
+                    st.session_state[decision_state_key] = "Reject"
+                    st.rerun()
+            with btn_col4:
+                if current_decision:
+                    dcolor = _decision_color(current_decision)
+                    st.markdown(
+                        f'<span style="background:{dcolor};color:white;padding:4px 12px;'
+                        f'border-radius:12px;font-weight:bold">{current_decision}</span>',
+                        unsafe_allow_html=True,
+                    )
 
             # Evidence
-            st.markdown("**🔍 Đoạn text liên quan nhất (AI):**")
+            st.markdown("**Đoạn text liên quan nhất (AI):**")
             for i, (chunk, sim) in enumerate(result.evidence, start=1):
                 sim_pct = round(sim * 100, 1)
                 st.markdown(
@@ -483,9 +613,9 @@ def _render_candidate_cards(
                     expanded=False,
                 ):
                     sc1, sc2, sc3 = st.columns(3)
-                    sc1.metric("🎯 Điểm", f"{pct}%")
-                    sc2.metric("📅 KN", f"{result.experience_years} năm" if result.experience_years else "—")
-                    sc3.metric("🔧 Kỹ năng có", str(len(result.skills_found)))
+                    sc1.metric("Điểm", f"{pct}%")
+                    sc2.metric("KN", f"{result.experience_years} năm" if result.experience_years else "—")
+                    sc3.metric("Kỹ năng có", str(len(result.skills_found)))
                     if result.skills_found:
                         st.markdown("**Kỹ năng có:** " + ", ".join(result.skills_found))
                     if result.skills_missing:
@@ -616,6 +746,7 @@ def render_analysis_tab():
                     cv_text=cv_text,
                     jd_embedding=jd_embedding,
                     jd_skills=jd_skills,
+                    jd_summary=jd_summary,
                 )
                 raw_results.append(result)
                 progress.progress(
@@ -648,6 +779,7 @@ def render_analysis_tab():
             "raw_results": raw_results,
             "jd_skills": jd_skills,
             "jd_summary": jd_summary,
+            "jd_text": jd_text,
         }
 
     # Show results if available (from this run or previous interaction)
@@ -657,6 +789,7 @@ def render_analysis_tab():
             data["raw_results"],
             data["jd_skills"],
             data["jd_summary"],
+            data.get("jd_text", ""),
         )
     elif not run:
         if not jd_text:
@@ -673,6 +806,7 @@ def _render_results(
     raw_results: list[CVResult],
     jd_skills: list[str],
     jd_summary: JDSummary,
+    jd_text: str = "",
 ) -> None:
     """Full results section with dashboard, cards, comparison, export."""
 
@@ -849,9 +983,22 @@ def _render_results(
     )
 
     # -------------------------------------------------------------------
-    # Detailed cards
+    # Tabs: Detailed Cards | Shortlist | Real-time Filter Table
     # -------------------------------------------------------------------
-    _render_candidate_cards(display_list, pre_filtered_out)
+    tab_cards, tab_shortlist, tab_table = st.tabs([
+        "📋 Chi tiết ứng viên",
+        "⭐ Danh sách Shortlist",
+        "🔍 Bảng lọc real-time",
+    ])
+
+    with tab_cards:
+        _render_candidate_cards(display_list, pre_filtered_out, jd_text=jd_text)
+
+    with tab_shortlist:
+        _render_shortlist_tab(display_list, sorted_results, display_scores)
+
+    with tab_table:
+        _render_realtime_filter_table(sorted_results, display_scores, jd_skills)
 
     # -------------------------------------------------------------------
     # Comparison view
@@ -881,11 +1028,185 @@ def _render_results(
         )
     with col_xlsx:
         st.download_button(
-            label="⬇️ Tải Excel",
-            data=to_excel_bytes(df),
+            label="⬇️ Tải Excel (Multi-sheet)",
+            data=to_excel_bytes(df, jd_skills=jd_skills),
             file_name="cv_screening_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+
+# ---------------------------------------------------------------------------
+# Shortlist Tab
+# ---------------------------------------------------------------------------
+
+def _render_shortlist_tab(
+    display_list: list[tuple[CVResult, float]],
+    sorted_results: list[CVResult],
+    display_scores: list[float],
+) -> None:
+    """Display only candidates that the HR has marked as Shortlist."""
+    st.markdown("#### ⭐ Ứng viên đã shortlist")
+
+    shortlisted = []
+    for rank, (result, score) in enumerate(display_list, start=1):
+        decision_key = f"decision_{result.filename}_{rank}"
+        if st.session_state.get(decision_key) == "Shortlist":
+            shortlisted.append((rank, result, score))
+
+    # Also check full sorted list
+    if not shortlisted:
+        for rank, (result, score) in enumerate(
+            zip(sorted_results, display_scores), start=1
+        ):
+            decision_key = f"decision_{result.filename}_{rank}"
+            if st.session_state.get(decision_key) == "Shortlist":
+                shortlisted.append((rank, result, score))
+
+    if not shortlisted:
+        st.info(
+            "Chưa có ứng viên nào được shortlist. "
+            "Nhấn nút **✅ Shortlist** trên card ứng viên để thêm vào đây."
+        )
+        return
+
+    st.success(f"✅ {len(shortlisted)} ứng viên được shortlist")
+
+    rows = []
+    for rank, result, score in shortlisted:
+        rows.append({
+            "Rank": rank,
+            "Tên ứng viên": result.candidate_name or result.filename,
+            "Email": result.email or "—",
+            "SĐT": result.phone or "—",
+            "Điểm (%)": round(score * 100, 1),
+            "Kinh nghiệm": f"{result.experience_years} năm" if result.experience_years else "—",
+            "Kỹ năng có": ", ".join(result.skills_found[:5]) or "—",
+            "Thiếu must-have": ", ".join(result.must_have_missing) or "—",
+        })
+
+    sl_df = pd.DataFrame(rows)
+    st.dataframe(sl_df, use_container_width=True)
+
+    # Export shortlist
+    if not sl_df.empty:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "⬇️ Tải Shortlist CSV",
+                data=sl_df.to_csv(index=False).encode("utf-8"),
+                file_name="shortlist.csv",
+                mime="text/csv",
+                key="shortlist_csv_dl",
+            )
+        with col2:
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                sl_df.to_excel(w, index=False, sheet_name="Shortlist")
+            st.download_button(
+                "⬇️ Tải Shortlist Excel",
+                data=buf.getvalue(),
+                file_name="shortlist.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="shortlist_xlsx_dl",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Real-time Filter Table
+# ---------------------------------------------------------------------------
+
+def _render_realtime_filter_table(
+    sorted_results: list[CVResult],
+    display_scores: list[float],
+    jd_skills: list[str],
+) -> None:
+    """Interactive st.dataframe with real-time search/filter/sort."""
+    st.markdown("#### 🔍 Lọc & sắp xếp real-time")
+    st.caption(
+        "Lọc theo tên, kỹ năng, điểm số. "
+        "Nhấp vào cột header để sắp xếp. "
+        "Dùng thanh search để tìm ứng viên theo tên."
+    )
+
+    # Build dataframe
+    rows = []
+    for rank, (result, score) in enumerate(zip(sorted_results, display_scores), start=1):
+        decision_key = f"decision_{result.filename}_{rank}"
+        decision = st.session_state.get(decision_key, "—")
+        rows.append({
+            "Rank": rank,
+            "Tên ứng viên": result.candidate_name or "—",
+            "File": result.filename,
+            "Email": result.email or "—",
+            "SĐT": result.phone or "—",
+            "Điểm (%)": round(score * 100, 1),
+            "Ngữ nghĩa (%)": round(result.semantic_score * 100, 1),
+            "Kỹ năng (%)": round(result.skill_score * 100, 1),
+            "Kinh nghiệm (năm)": result.experience_years if result.experience_years else 0,
+            "Có dự án": "✔" if result.has_projects else "✗",
+            "Job Hopping": "⚠️" if result.job_hopping else "—",
+            "Kỹ năng có": ", ".join(result.skills_found[:6]) or "—",
+            "Thiếu must-have": ", ".join(result.must_have_missing[:4]) or "—",
+            "Red Flags": len(result.red_flags),
+            "Quyết định HR": decision,
+        })
+
+    df_rt = pd.DataFrame(rows)
+
+    # Filter controls
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        name_search = st.text_input(
+            "🔎 Tìm theo tên ứng viên / tên file",
+            key="rt_name_search",
+        )
+    with f2:
+        min_score_rt = st.slider(
+            "Điểm tối thiểu (%)", 0, 100, 0, 5, key="rt_min_score"
+        )
+    with f3:
+        skill_filter = st.multiselect(
+            "Phải có kỹ năng",
+            options=jd_skills,
+            key="rt_skill_filter",
+        )
+
+    # Apply filters
+    filtered_df = df_rt.copy()
+    if name_search:
+        mask = (
+            filtered_df["Tên ứng viên"].str.contains(name_search, case=False, na=False)
+            | filtered_df["File"].str.contains(name_search, case=False, na=False)
+        )
+        filtered_df = filtered_df[mask]
+    if min_score_rt > 0:
+        filtered_df = filtered_df[filtered_df["Điểm (%)"] >= min_score_rt]
+    if skill_filter:
+        for skill in skill_filter:
+            filtered_df = filtered_df[
+                filtered_df["Kỹ năng có"].str.contains(skill, case=False, na=False)
+            ]
+
+    st.caption(f"Hiển thị **{len(filtered_df)}** / {len(df_rt)} ứng viên")
+
+    st.dataframe(
+        filtered_df,
+        use_container_width=True,
+        column_config={
+            "Điểm (%)": st.column_config.ProgressColumn(
+                "Điểm (%)", min_value=0, max_value=100, format="%.1f%%"
+            ),
+            "Ngữ nghĩa (%)": st.column_config.ProgressColumn(
+                "Ngữ nghĩa (%)", min_value=0, max_value=100, format="%.1f%%"
+            ),
+            "Kỹ năng (%)": st.column_config.ProgressColumn(
+                "Kỹ năng (%)", min_value=0, max_value=100, format="%.1f%%"
+            ),
+        },
+        hide_index=True,
+    )
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -928,10 +1249,15 @@ def render_history_tab():
                     [
                         {
                             "Rank": r["rank"],
+                            "Tên ứng viên": r["candidate_name"] or "—",
+                            "Email": r["email"] or "—",
+                            "SĐT": r["phone"] or "—",
                             "Tên file": r["filename"],
                             "Tổng điểm (%)": round(r["score"] * 100, 1),
                             "Ngữ nghĩa (%)": round(r["semantic_score"] * 100, 1),
                             "Kỹ năng (%)": round(r["skill_score"] * 100, 1),
+                            "Kinh nghiệm (năm)": r.get("experience_years", "—"),
+                            "Quyết định HR": r.get("decision") or "—",
                             "Kỹ năng có": ", ".join(r["skills_found"]) or "—",
                             "Thiếu kỹ năng": ", ".join(r["skills_missing"]) or "—",
                             "Nhận xét": r["summary"],
@@ -986,26 +1312,31 @@ def render_about_tab():
 
 ```
 Semantic Score    = mean(top-3 cosine similarity giữa chunks CV và JD)
-Skill Score       = số kỹ năng CV có / tổng kỹ năng JD yêu cầu
+Skill Score       = weighted coverage (must-have penalty -15pt/skill, nice-to-have -5pt/skill)
 Experience Score  = min(1.0, số_năm / 5.0)
 Composite Score   = w_sem × Semantic + w_skill × Skill + w_exp × Experience
                     (w_sem + w_skill + w_exp được chuẩn hóa = 100%)
 ```
 
-### Tính năng mới
+### Tính năng mới (v2)
 
 | Tính năng | Mô tả |
 |---|---|
+| **Must-have / Nice-to-have scoring** | Thiếu must-have → trừ 15đ/skill; thiếu nice-to-have → trừ 5đ/skill |
+| **Contact extraction** | Tự động trích tên, email, SĐT từ CV để HR liên hệ trực tiếp |
+| **CV Section Parser** | Phân tích Work Experience / Skills / Education riêng biệt |
+| **Job-hopping detection** | Phát hiện ứng viên nhảy việc từ section Work Experience |
+| **LLM summary** | OpenAI/Gemini/Groq tạo nhận xét tự nhiên, gợi ý câu hỏi phỏng vấn |
+| **Decision buttons** | ✅ Shortlist / ⏸ Cân nhắc / ❌ Loại ngay trên card ứng viên |
+| **Shortlist tab** | Tab riêng tổng hợp ứng viên được shortlist, kèm export |
+| **Real-time filter table** | Bảng lọc/sort theo tên, kỹ năng, điểm — progress bar trực quan |
+| **Multi-sheet Excel** | "Tất cả ứng viên" + "Shortlist" + "Thống kê JD" + conditional formatting |
 | **JD Intelligence** | Tự động phân loại must-have / nice-to-have skills từ JD |
 | **Pre-filter** | Lọc ứng viên trước khi hiển thị (KN tối thiểu, kỹ năng bắt buộc) |
 | **Configurable Weights** | Sidebar sliders điều chỉnh trọng số chấm điểm |
 | **Quick Tags** | Badge tóm tắt: Senior, Strong Python, Missing Docker, Has Projects… |
 | **Red Flag Detection** | Phát hiện CV đáng ngờ: quá ngắn, nhiều skill không có project… |
 | **Insight Dashboard** | Tổng quan: phân bổ match, skill % ứng viên, lịch sử kinh nghiệm |
-| **Next Action** | Gợi ý AI: nên phỏng vấn ai, hạ yêu cầu skill nào |
-| **Comparison View** | So sánh side-by-side 2–4 ứng viên |
-| **Post-filter** | Lọc kết quả sau phân tích (min score, top N, hide red flags) |
-| **Reactive weights** | Thay đổi trọng số → xếp hạng cập nhật ngay, không cần chạy lại AI |
 
 ### Pipeline trích xuất PDF (4 tầng)
 
