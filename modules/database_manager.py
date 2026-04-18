@@ -114,8 +114,9 @@ def init_db() -> None:
         for sql in _MIGRATIONS:
             try:
                 conn.execute(sql)
-            except sqlite3.OperationalError:
-                pass  # column already exists
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
 
 # ---------------------------------------------------------------------------

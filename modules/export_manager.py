@@ -180,7 +180,7 @@ def to_excel_bytes(df: pd.DataFrame, jd_skills: list[str] | None = None) -> byte
                     "Kỹ năng JD": skill,
                     "Số CV có": found_count,
                     "Số CV thiếu": missing_count,
-                    "% có (/)": round(found_count / total * 100, 1) if total else 0,
+                    "Tỷ lệ có (%)": round(found_count / total * 100, 1) if total else 0,
                     "Gợi ý": "⚠️ Thiếu nhiều" if found_count / max(total, 1) < 0.4 else "✅ OK",
                 })
             stats_df = pd.DataFrame(skill_rows)
