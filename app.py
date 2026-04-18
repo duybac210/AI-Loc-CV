@@ -7,11 +7,23 @@ Run with:
 from __future__ import annotations
 
 import io
+import os
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Load .env file if present (GROQ_API_KEY, etc.)
+# ---------------------------------------------------------------------------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed; rely on system env vars only
+
+_ENV_GROQ_KEY: str = os.environ.get("GROQ_API_KEY", "").strip()
 
 from config import (
     APP_DESCRIPTION,
@@ -55,6 +67,15 @@ st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, layout="wide")
 init_db()
 
 # ---------------------------------------------------------------------------
+# Auto-configure Groq from environment variable (set once, never shown in UI)
+# ---------------------------------------------------------------------------
+if _ENV_GROQ_KEY and "llm_api_key" not in st.session_state:
+    st.session_state["llm_enabled"] = True
+    st.session_state["llm_provider"] = "groq"
+    st.session_state["llm_api_key"] = _ENV_GROQ_KEY
+    st.session_state["llm_model"] = ""
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -75,6 +96,38 @@ def score_badge(score: float) -> str:
 @st.cache_resource(show_spinner="Loading multilingual AI model (first time ~60 s)…")
 def load_model():
     return get_model()
+
+
+# ---------------------------------------------------------------------------
+# Groq connectivity check
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _check_groq_status(api_key: str, model: str) -> tuple[bool, str]:
+    """
+    Test whether the Groq API key is valid by sending a minimal request.
+
+    Returns
+    -------
+    (ok: bool, message: str)
+    """
+    if not api_key:
+        return False, "Chưa cấu hình API key."
+    try:
+        from groq import Groq
+    except ImportError:
+        return False, "Package `groq` chưa được cài. Chạy: pip install groq"
+    try:
+        client = Groq(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=model or "llama3-8b-8192",
+            messages=[{"role": "user", "content": "Hi"}],
+            max_tokens=5,
+        )
+        reply = (resp.choices[0].message.content or "").strip()
+        return True, f"Model: {model or 'llama3-8b-8192'} · Phản hồi thử: \"{reply}\""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _compute_display_scores(
@@ -175,34 +228,83 @@ def render_sidebar():
         with st.container(border=True):
             st.markdown("### ✨ AI phân tích nâng cao")
             st.caption("Nhận xét tự nhiên · Câu hỏi phỏng vấn · So sánh ứng viên")
-            llm_enabled = st.toggle("Bật AI nâng cao (LLM)", value=False, key="llm_enabled")
+
+            # If env var supplied a key, default the toggle to True
+            _default_enabled = bool(_ENV_GROQ_KEY)
+            llm_enabled = st.toggle(
+                "Bật AI nâng cao (LLM)",
+                value=_default_enabled,
+                key="llm_enabled",
+            )
             if llm_enabled:
                 llm_provider = st.selectbox(
                     "Provider",
                     options=["groq", "openai", "gemini"],
                     key="llm_provider",
                 )
-                if st.session_state.get("llm_provider", "groq") == "groq":
-                    st.markdown(
-                        "💡 **Groq miễn phí!** Lấy API key tại "
-                        "[console.groq.com](https://console.groq.com) "
-                        "(đăng ký nhanh, không cần thẻ tín dụng)"
+
+                # When Groq key is from env, show a read-only indicator instead of text input
+                current_provider = st.session_state.get("llm_provider", "groq")
+                if current_provider == "groq" and _ENV_GROQ_KEY:
+                    st.info("🔑 API key được nạp tự động từ biến môi trường `GROQ_API_KEY`.")
+                    # Keep the session key populated but don't expose in UI
+                    st.session_state.setdefault("llm_api_key", _ENV_GROQ_KEY)
+                    llm_model = st.text_input(
+                        "Model (để trống = mặc định)",
+                        placeholder="llama3-8b-8192",
+                        key="llm_model",
                     )
-                llm_api_key = st.text_input(
-                    "API Key",
-                    type="password",
-                    placeholder="gsk_... (Groq) / sk-... (OpenAI) / AIza... (Gemini)",
-                    key="llm_api_key",
-                )
-                llm_model = st.text_input(
-                    "Model (để trống = mặc định)",
-                    placeholder="llama3-8b-8192 / gpt-4o-mini / gemini-1.5-flash",
-                    key="llm_model",
-                )
-                if llm_api_key:
-                    st.success("✅ AI nâng cao đã được cấu hình")
                 else:
-                    st.info("ℹ️ Nhập API key để bật. Key không được lưu vào database.")
+                    if current_provider == "groq":
+                        st.markdown(
+                            "💡 **Groq miễn phí!** Lấy API key tại "
+                            "[console.groq.com](https://console.groq.com) "
+                            "(đăng ký nhanh, không cần thẻ tín dụng)"
+                        )
+                    llm_api_key = st.text_input(
+                        "API Key",
+                        type="password",
+                        placeholder="gsk_... (Groq) / sk-... (OpenAI) / AIza... (Gemini)",
+                        key="llm_api_key",
+                    )
+                    llm_model = st.text_input(
+                        "Model (để trống = mặc định)",
+                        placeholder="llama3-8b-8192 / gpt-4o-mini / gemini-1.5-flash",
+                        key="llm_model",
+                    )
+                    if llm_api_key:
+                        st.success("✅ AI nâng cao đã được cấu hình")
+                    else:
+                        st.info("ℹ️ Nhập API key để bật. Key không được lưu vào database.")
+
+                # ---- Groq connectivity status panel ----
+                if current_provider == "groq":
+                    _api_key_to_test = st.session_state.get("llm_api_key", "")
+                    _model_to_test = st.session_state.get("llm_model", "")
+                    col_status, col_btn = st.columns([3, 1])
+                    with col_btn:
+                        _run_test = st.button("🔄 Kiểm tra", key="groq_test_btn")
+                    if _run_test:
+                        _check_groq_status.clear()
+                    if _api_key_to_test:
+                        with st.spinner("Đang kiểm tra kết nối Groq..."):
+                            _groq_ok, _groq_msg = _check_groq_status(
+                                _api_key_to_test, _model_to_test
+                            )
+                        if _groq_ok:
+                            st.success(f"✅ **Groq hoạt động bình thường**\n\n{_groq_msg}")
+                        else:
+                            st.error(
+                                f"❌ **Groq lỗi — cần kiểm tra**\n\n"
+                                f"```\n{_groq_msg}\n```\n\n"
+                                "**Cách khắc phục thường gặp:**\n"
+                                "- API key hết hạn → lấy key mới tại console.groq.com\n"
+                                "- Model không tồn tại → thử `llama3-8b-8192`\n"
+                                "- Rate limit → đợi 1 phút rồi thử lại"
+                            )
+                    else:
+                        st.warning("⚠️ Chưa có API key để kiểm tra.")
+
             else:
                 st.caption(
                     "🔒 Đang dùng AI ngữ nghĩa (embedding). "
