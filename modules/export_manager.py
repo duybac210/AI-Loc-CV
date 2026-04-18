@@ -1,20 +1,24 @@
 """
 modules/export_manager.py
 Builds a pandas DataFrame from CVResult objects and provides helpers
-for CSV and Excel export (Streamlit download buttons).
+for CSV, Excel, and PDF export (Streamlit download buttons).
 
 Excel export: multi-sheet workbook with conditional formatting
   - Sheet 1: "Tất cả ứng viên"
   - Sheet 2: "Shortlist"
   - Sheet 3: "Thống kê JD"
+
+PDF export: per-candidate report cards using fpdf2, bundled into one PDF.
 """
 from __future__ import annotations
 
 import io
 import re
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
+from fpdf import FPDF
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -197,3 +201,190 @@ def to_excel_bytes(df: pd.DataFrame, jd_skills: list[str] | None = None) -> byte
                 )
 
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# PDF batch report (fpdf2)
+# ---------------------------------------------------------------------------
+
+def _safe_str(value: object, max_len: int = 200) -> str:
+    """Convert value to a safe ASCII-ish string for fpdf (latin-1 safe)."""
+    text = str(value) if value is not None else ""
+    # Replace characters outside latin-1 range with their closest ASCII equivalent
+    text = text.encode("latin-1", errors="replace").decode("latin-1")
+    return text[:max_len]
+
+
+def to_pdf_bytes(results: list[CVResult], jd_snippet: str = "") -> bytes:
+    """
+    Generate a multi-page PDF report for a list of CVResults.
+
+    One summary page (all candidates ranked) + one detail page per candidate.
+
+    Parameters
+    ----------
+    results     : list[CVResult]  ranked candidate results
+    jd_snippet  : str             short excerpt of the job description
+
+    Returns
+    -------
+    bytes  – raw PDF bytes suitable for st.download_button
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_margins(15, 15, 15)
+
+    # ------------------------------------------------------------------ #
+    # Cover / summary page                                                 #
+    # ------------------------------------------------------------------ #
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, "CV Screening Report", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 7, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
+    pdf.ln(4)
+
+    if jd_snippet:
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.multi_cell(0, 6, f"JD: {_safe_str(jd_snippet, 160)}")
+        pdf.ln(4)
+
+    # Summary table header
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_fill_color(31, 78, 121)   # dark blue
+    pdf.set_text_color(255, 255, 255)
+    col_widths = [12, 55, 22, 22, 22, 22, 25]
+    headers = ["Rank", "Candidate / File", "Score%", "Sem%", "Skill%", "Exp(yr)", "Decision"]
+    for w, h in zip(col_widths, headers):
+        pdf.cell(w, 8, h, border=1, fill=True, align="C")
+    pdf.ln()
+
+    # Summary table rows
+    pdf.set_text_color(0, 0, 0)
+    for rank, r in enumerate(results, start=1):
+        pdf.set_font("Helvetica", "", 8)
+        score_pct = round(r.score * 100, 1)
+        # Row colour: green / yellow / red
+        if score_pct >= 70:
+            pdf.set_fill_color(198, 239, 206)
+        elif score_pct >= 50:
+            pdf.set_fill_color(255, 235, 156)
+        else:
+            pdf.set_fill_color(255, 199, 206)
+
+        name_str = _safe_str(r.candidate_name or r.filename, 40)
+        values = [
+            str(rank),
+            name_str,
+            f"{score_pct}",
+            f"{round(r.semantic_score * 100, 1)}",
+            f"{round(r.skill_score * 100, 1)}",
+            str(r.experience_years) if r.experience_years else "-",
+            "-",
+        ]
+        for w, v in zip(col_widths, values):
+            pdf.cell(w, 7, v, border=1, fill=True, align="C")
+        pdf.ln()
+
+    # ------------------------------------------------------------------ #
+    # Detail pages — one per candidate                                     #
+    # ------------------------------------------------------------------ #
+    for rank, r in enumerate(results, start=1):
+        pdf.add_page()
+
+        # Header bar
+        pdf.set_fill_color(31, 78, 121)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 13)
+        score_pct = round(r.score * 100, 1)
+        name_display = _safe_str(r.candidate_name or r.filename, 60)
+        pdf.cell(0, 10, f"#{rank}  {name_display}  -  Score: {score_pct}%",
+                 border=0, fill=True, ln=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(3)
+
+        # Contact info
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(35, 6, "Email:", border=0)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 6, _safe_str(r.email or "-"), ln=True)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(35, 6, "Phone:", border=0)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 6, _safe_str(r.phone or "-"), ln=True)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(35, 6, "File:", border=0)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 6, _safe_str(r.filename, 80), ln=True)
+        pdf.ln(3)
+
+        # Score breakdown
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(220, 230, 241)
+        pdf.cell(0, 7, "Score Breakdown", border=1, fill=True, ln=True)
+        pdf.set_font("Helvetica", "", 9)
+        breakdown = [
+            ("Composite Score", f"{score_pct}%"),
+            ("Semantic", f"{round(r.semantic_score * 100, 1)}%"),
+            ("Skill Coverage", f"{round(r.skill_score * 100, 1)}%"),
+            ("Experience", f"{r.experience_years} yr" if r.experience_years else "-"),
+        ]
+        for label, val in breakdown:
+            pdf.cell(60, 6, label, border="LR")
+            pdf.cell(0, 6, val, border="R", ln=True)
+        pdf.ln(3)
+
+        # Skills found
+        if r.skills_found:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(220, 230, 241)
+            pdf.cell(0, 7, "Skills Found", border=1, fill=True, ln=True)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 6, _safe_str(", ".join(r.skills_found), 300))
+            pdf.ln(2)
+
+        # Skills missing
+        if r.skills_missing:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(255, 235, 156)
+            pdf.cell(0, 7, "Skills Missing", border=1, fill=True, ln=True)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 6, _safe_str(", ".join(r.skills_missing), 300))
+            pdf.ln(2)
+
+        # Must-have missing (red)
+        if r.must_have_missing:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(255, 199, 206)
+            pdf.cell(0, 7, "Must-Have Missing (!)", border=1, fill=True, ln=True)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 6, _safe_str(", ".join(r.must_have_missing), 200))
+            pdf.ln(2)
+
+        # Tags
+        if r.tags:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(220, 230, 241)
+            pdf.cell(0, 7, "Tags", border=1, fill=True, ln=True)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.multi_cell(0, 6, _safe_str(" | ".join(r.tags), 200))
+            pdf.ln(2)
+
+        # Red flags
+        if r.red_flags:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(255, 199, 206)
+            pdf.cell(0, 7, "Red Flags", border=1, fill=True, ln=True)
+            pdf.set_font("Helvetica", "", 9)
+            for flag in r.red_flags:
+                pdf.multi_cell(0, 6, f"  - {_safe_str(flag, 120)}")
+            pdf.ln(2)
+
+        # Summary
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(220, 230, 241)
+        pdf.cell(0, 7, "AI Summary", border=1, fill=True, ln=True)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.multi_cell(0, 5, _safe_str(r.summary, 500))
+
+    return bytes(pdf.output())
