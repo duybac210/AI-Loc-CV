@@ -38,10 +38,10 @@ from modules.database_manager import (
     update_decision,
 )
 from modules.embedding_manager import encode, get_model
-from modules.export_manager import results_to_dataframe, to_csv_bytes, to_excel_bytes
+from modules.export_manager import results_to_dataframe, to_csv_bytes, to_excel_bytes, to_pdf_bytes
 from modules.jd_parser import JDSummary, parse_jd
 from modules.llm_analyzer import LLMConfig, generate_llm_summary, SUPPORTED_PROVIDERS
-from modules.pdf_processor import extract_text_from_pdf, OCR_PREFIX
+from modules.pdf_processor import extract_text_from_pdf, extract_text_from_docx, OCR_PREFIX
 
 # ---------------------------------------------------------------------------
 # Page config & DB init
@@ -210,6 +210,7 @@ def render_sidebar():
             st.markdown("**Ngôn ngữ:** Tiếng Việt + Tiếng Anh (cross-lingual)")
             st.markdown("**Phương pháp:** Semantic embeddings + Skill coverage + Experience")
             st.markdown("**PDF hỗ trợ:** pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract)")
+            st.markdown("**DOCX hỗ trợ:** python-docx (paragraphs + tables)")
 
 
 # ---------------------------------------------------------------------------
@@ -665,6 +666,57 @@ def _render_comparison_view(
     df_cmp = pd.DataFrame(rows).set_index("Ứng viên").T
     st.dataframe(df_cmp, use_container_width=True)
 
+    # ---- Radar / Spider chart ----
+    _render_radar_chart(chosen_pairs)
+
+
+def _render_radar_chart(
+    chosen_pairs: list[tuple[CVResult, float]],
+) -> None:
+    """
+    Radar chart comparing multiple candidates across 5 dimensions:
+    Total Score, Semantic, Skill Coverage, Experience, Projects.
+    """
+    if len(chosen_pairs) < 2:
+        return
+
+    categories = ["Tổng điểm", "Ngữ nghĩa", "Kỹ năng", "Kinh nghiệm", "Dự án"]
+
+    fig_radar = go.Figure()
+    for r, s in chosen_pairs:
+        exp_norm = min(100.0, (r.experience_years or 0) / 5.0 * 100)
+        project_score = 100.0 if r.has_projects else 0.0
+        values = [
+            round(s * 100, 1),
+            round(r.semantic_score * 100, 1),
+            round(r.skill_score * 100, 1),
+            round(exp_norm, 1),
+            project_score,
+        ]
+        # Close the polygon
+        values_closed = values + [values[0]]
+        cats_closed = categories + [categories[0]]
+
+        label = r.candidate_name or r.filename
+        fig_radar.add_trace(go.Scatterpolar(
+            r=values_closed,
+            theta=cats_closed,
+            fill="toself",
+            opacity=0.5,
+            name=label[:40],
+        ))
+
+    fig_radar.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 100]),
+        ),
+        title="📡 Radar Chart – so sánh đa chiều ứng viên",
+        showlegend=True,
+        height=420,
+        margin=dict(l=40, r=40, t=60, b=40),
+    )
+    st.plotly_chart(fig_radar, use_container_width=True)
+
 
 # ---------------------------------------------------------------------------
 # UI – Analysis Tab
@@ -692,10 +744,10 @@ def render_analysis_tab():
         )
 
     with col_cv:
-        st.subheader("📄 Upload CV (PDF)")
+        st.subheader("📄 Upload CV (PDF / DOCX)")
         uploaded_files = st.file_uploader(
-            label="Upload một hoặc nhiều file CV dạng PDF",
-            type=["pdf"],
+            label="Upload một hoặc nhiều file CV dạng PDF hoặc DOCX",
+            type=["pdf", "docx"],
             accept_multiple_files=True,
             key="cv_upload",
         )
@@ -733,9 +785,14 @@ def render_analysis_tab():
 
             for i, uploaded_file in enumerate(uploaded_files):
                 cv_bytes = uploaded_file.read()
-                cv_text = extract_text_from_pdf(cv_bytes)
+                fname_lower = uploaded_file.name.lower()
 
-                if cv_text.startswith("[PDF extraction failed"):
+                if fname_lower.endswith(".docx"):
+                    cv_text = extract_text_from_docx(cv_bytes)
+                else:
+                    cv_text = extract_text_from_pdf(cv_bytes)
+
+                if cv_text.startswith("[PDF extraction failed") or cv_text.startswith("[DOCX extraction failed"):
                     errors.append(uploaded_file.name)
                 elif cv_text.startswith(OCR_PREFIX):
                     ocr_files.append(uploaded_file.name)
@@ -764,7 +821,7 @@ def render_analysis_tab():
             st.warning(
                 f"⚠️ Không thể trích xuất text từ {len(errors)} file(s): "
                 f"{', '.join(errors)}. "
-                "File có thể là PDF scan hoặc bị mã hoá – điểm sẽ thấp bất thường."
+                "File có thể là PDF scan, bị mã hoá, hoặc DOCX bị lỗi – điểm sẽ thấp bất thường."
             )
         if ocr_files:
             st.info(
@@ -1018,7 +1075,7 @@ def _render_results(
     df = results_to_dataframe(all_for_export)
     st.dataframe(df, use_container_width=True)
 
-    col_csv, col_xlsx = st.columns(2)
+    col_csv, col_xlsx, col_pdf = st.columns(3)
     with col_csv:
         st.download_button(
             label="⬇️ Tải CSV",
@@ -1032,6 +1089,14 @@ def _render_results(
             data=to_excel_bytes(df, jd_skills=jd_skills),
             file_name="cv_screening_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with col_pdf:
+        jd_snippet = jd_text[:120].replace("\n", " ") if jd_text else ""
+        st.download_button(
+            label="⬇️ Tải báo cáo PDF",
+            data=to_pdf_bytes(all_for_export, jd_snippet=jd_snippet),
+            file_name="cv_screening_report.pdf",
+            mime="application/pdf",
         )
 
 
@@ -1304,6 +1369,7 @@ def render_about_tab():
 | **AI Model** | `paraphrase-multilingual-MiniLM-L12-v2` (hỗ trợ 50+ ngôn ngữ) |
 | **Ngôn ngữ** | Tiếng Việt + Tiếng Anh (cross-lingual matching) |
 | **PDF Extraction** | pdfplumber → PyMuPDF → PyPDF2 → OCR (Tesseract vie+eng) |
+| **DOCX Extraction** | python-docx (paragraphs + tables) |
 | **Cơ sở dữ liệu** | SQLite (lưu lịch sử tất cả phiên phân tích) |
 | **JD Parser** | Rule-based: trích xuất must-have / nice-to-have / level / kinh nghiệm |
 | **Scoring** | Composite = Ngữ nghĩa + Kỹ năng + Kinh nghiệm (trọng số tuỳ chỉnh) |
@@ -1318,7 +1384,16 @@ Composite Score   = w_sem × Semantic + w_skill × Skill + w_exp × Experience
                     (w_sem + w_skill + w_exp được chuẩn hóa = 100%)
 ```
 
-### Tính năng mới (v2)
+### Tính năng mới (v3)
+
+| Tính năng | Mô tả |
+|---|---|
+| **Hỗ trợ DOCX** | Upload file Word (.docx) — python-docx đọc paragraphs + tables |
+| **Radar chart** | So sánh đa chiều ứng viên (Tổng điểm, Ngữ nghĩa, Kỹ năng, Kinh nghiệm, Dự án) |
+| **Báo cáo PDF** | Xuất báo cáo PDF nhiều trang: trang tổng hợp + 1 trang chi tiết/ứng viên |
+| **Mở rộng SKILL_KEYWORDS** | +20 kỹ năng mới: LangChain, Kafka, Elasticsearch, Spark, Airflow, Terraform, Flutter, React Native, v.v. |
+
+### Tính năng (v2)
 
 | Tính năng | Mô tả |
 |---|---|
@@ -1338,14 +1413,15 @@ Composite Score   = w_sem × Semantic + w_skill × Skill + w_exp × Experience
 | **Red Flag Detection** | Phát hiện CV đáng ngờ: quá ngắn, nhiều skill không có project… |
 | **Insight Dashboard** | Tổng quan: phân bổ match, skill % ứng viên, lịch sử kinh nghiệm |
 
-### Pipeline trích xuất PDF (4 tầng)
+### Pipeline trích xuất file CV
 
-| Bước | Thư viện | Xử lý tốt |
-|---|---|---|
-| 1 | **pdfplumber** | CV text thông thường, bảng biểu |
-| 2 | **PyMuPDF** | CV thiết kế (Canva, template đẹp), font đặc biệt |
-| 3 | **PyPDF2** | Fallback nhẹ |
-| 4 | **Tesseract OCR** | CV scan, ảnh chụp, PDF hình ảnh |
+| Định dạng | Bước | Thư viện | Xử lý tốt |
+|---|---|---|---|
+| **PDF** | 1 | **pdfplumber** | CV text thông thường, bảng biểu |
+| **PDF** | 2 | **PyMuPDF** | CV thiết kế (Canva, template đẹp), font đặc biệt |
+| **PDF** | 3 | **PyPDF2** | Fallback nhẹ |
+| **PDF** | 4 | **Tesseract OCR** | CV scan, ảnh chụp, PDF hình ảnh |
+| **DOCX** | — | **python-docx** | File Word (.docx), đọc paragraphs + tables |
 
 > **Lưu ý:** Bước OCR cần cài `tesseract-ocr` và `poppler-utils` trên hệ thống.
 > Trên Ubuntu/Debian: `sudo apt install tesseract-ocr tesseract-ocr-vie poppler-utils`

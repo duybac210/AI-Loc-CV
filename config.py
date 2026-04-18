@@ -115,4 +115,40 @@ SKILL_KEYWORDS: dict[str, list[str]] = {
     "Quản lý dự án":    ["quản lý dự án", "project management", "pm", "pmp", "lập kế hoạch dự án"],
     "Làm việc nhóm":    ["làm việc nhóm", "teamwork", "team player", "phối hợp nhóm"],
     "Tư duy phân tích": ["tư duy phân tích", "analytical thinking", "problem solving", "giải quyết vấn đề"],
+
+    # AI / LLM / Modern ML
+    "LangChain":        ["langchain", "lang chain", "langchain4j"],
+    "LlamaIndex":       ["llamaindex", "llama index", "llama_index"],
+    "OpenAI API":       ["openai", "chatgpt api", "gpt-4", "gpt-3.5", "davinci", "gpt4", "gpt3"],
+    "Hugging Face":     ["huggingface", "hugging face", "transformers", "datasets", "peft", "trl"],
+    "MLflow":           ["mlflow", "ml flow"],
+    "Airflow":          ["airflow", "apache airflow", "dag", "workflow orchestration"],
+    "Spark":            ["spark", "apache spark", "pyspark", "databricks", "rdd"],
+
+    # Event streaming / messaging
+    "Kafka":            ["kafka", "apache kafka", "confluent", "event streaming",
+                         "message queue kafka"],
+    "RabbitMQ":         ["rabbitmq", "rabbit mq", "amqp", "message broker"],
+    "Celery":           ["celery", "celery worker", "task queue"],
+
+    # Search & observability
+    "Elasticsearch":    ["elasticsearch", "elastic search", "opensearch", "kibana",
+                         "elk stack", "logstash"],
+    "Prometheus":       ["prometheus", "grafana", "alertmanager", "observability metrics"],
+
+    # Infrastructure / DevOps
+    "Terraform":        ["terraform", "iac", "infrastructure as code", "hcl"],
+    "Ansible":          ["ansible", "playbook", "configuration management"],
+    "Nginx":            ["nginx", "reverse proxy", "web server nginx"],
+
+    # Mobile
+    "Flutter":          ["flutter", "dart", "flutter developer"],
+    "React Native":     ["react native", "reactnative", "expo", "mobile react"],
+
+    # Modern back-end / protocols
+    "FastAPI":          ["fastapi", "fast api"],
+    "gRPC":             ["grpc", "protobuf", "protocol buffer"],
+    "WebSocket":        ["websocket", "socket.io", "real-time websocket"],
+    "Next.js":          ["next.js", "nextjs", "ssr react", "server side rendering react"],
+    "TypeScript":       ["typescript", "ts strict", "type safe", "typed javascript"],
 }

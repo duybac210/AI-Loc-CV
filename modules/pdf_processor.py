@@ -1,12 +1,14 @@
 """
 modules/pdf_processor.py
-Extracts raw text from PDF files uploaded via Streamlit (BytesIO or file path).
+Extracts raw text from PDF or DOCX files uploaded via Streamlit (BytesIO or file path).
 
-Extraction pipeline (in order):
+PDF extraction pipeline (in order):
   1. pdfplumber  – best for text-based, layout-rich PDFs
   2. PyMuPDF (fitz) – handles many designer/template PDFs that pdfplumber misses
   3. PyPDF2       – lightweight fallback
   4. OCR (pytesseract + pdf2image) – last resort for scanned / image-only PDFs
+
+DOCX extraction: python-docx reads paragraph and table text directly.
 
 Splits text into overlapping chunks for semantic search.
 """
@@ -42,6 +44,13 @@ try:
     _OCR_AVAILABLE = True
 except ImportError:
     _OCR_AVAILABLE = False
+
+# Optional DOCX support
+try:
+    import docx as _docx_module  # python-docx
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
 
 
 def extract_text_from_pdf(source: Union[bytes, str]) -> str:
@@ -161,7 +170,56 @@ def _extract_ocr(raw: bytes) -> str:
         return ""
 
 
-def clean_text(text: str) -> str:
+def extract_text_from_docx(source: Union[bytes, str]) -> str:
+    """
+    Extract all text from a DOCX file.
+
+    Reads paragraphs and table cells using python-docx.
+    Note: Only the modern DOCX format (.docx) is supported.
+    Legacy binary DOC files (.doc) are not supported by python-docx.
+
+    Parameters
+    ----------
+    source : bytes | str
+        Raw bytes of the DOCX file or a file path string.
+
+    Returns
+    -------
+    str
+        Concatenated plain text, or an error description on failure.
+    """
+    if not _DOCX_AVAILABLE:
+        return "[DOCX extraction failed: python-docx is not installed. Run: pip install python-docx]"
+
+    try:
+        if isinstance(source, (bytes, bytearray)):
+            raw = bytes(source)
+            doc = _docx_module.Document(io.BytesIO(raw))
+        else:
+            doc = _docx_module.Document(source)
+
+        parts: list[str] = []
+
+        # Paragraphs (main body)
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+
+        # Tables
+        for table in doc.tables:
+            for row in table.rows:
+                row_texts = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if row_texts:
+                    parts.append(" | ".join(row_texts))
+
+        return "\n".join(parts) if parts else "[DOCX extraction failed: empty document]"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DOCX extraction failed: %s", exc)
+        return f"[DOCX extraction failed: {exc}]"
+
+
+
     """
     Normalise whitespace and remove repeated blank lines while keeping
     meaningful line breaks that separate CV sections.
