@@ -220,6 +220,7 @@ def extract_text_from_docx(source: Union[bytes, str]) -> str:
 
 
 
+def clean_text(text: str) -> str:
     """
     Normalise whitespace and remove repeated blank lines while keeping
     meaningful line breaks that separate CV sections.
