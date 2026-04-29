@@ -1,0 +1,3 @@
+[server]
+# Avoid noisy module path introspection logs from transformers lazy modules.
+fileWatcherType = "none"

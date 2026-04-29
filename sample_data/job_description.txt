@@ -1,0 +1,48 @@
+Senior Full-Stack Developer – Job Description
+
+Company: TechVision Corp
+Location: Ho Chi Minh City, Vietnam (Hybrid)
+Type: Full-time
+
+About the Role
+--------------
+TechVision Corp is looking for a Senior Full-Stack Developer to join our growing engineering
+team. You will design, build, and maintain high-performance web applications serving millions
+of users. You will collaborate closely with product managers, designers, and data engineers
+to deliver features end-to-end.
+
+Key Responsibilities
+--------------------
+- Design and implement scalable RESTful APIs using Python (FastAPI / Django REST Framework).
+- Build responsive front-end interfaces with React and TypeScript.
+- Model and optimise relational databases using PostgreSQL.
+- Containerise and deploy services with Docker and Kubernetes on AWS.
+- Write comprehensive unit tests and integration tests (pytest, Jest).
+- Participate in code reviews and uphold engineering best practices.
+- Mentor junior engineers and contribute to architectural decisions.
+
+Required Skills & Experience
+-----------------------------
+- 4+ years of professional software development experience.
+- Strong proficiency in Python (FastAPI, Django, or Flask).
+- Hands-on experience with React and TypeScript.
+- Deep understanding of PostgreSQL (query optimisation, indexing, migrations).
+- Practical knowledge of Docker and container orchestration (Kubernetes / k8s).
+- Familiarity with CI/CD pipelines (GitHub Actions, GitLab CI, or Jenkins).
+- Solid understanding of Git workflows (branching strategies, pull requests).
+- Experience with REST API design and OpenAPI / Swagger documentation.
+- Working knowledge of AWS cloud services (EC2, S3, RDS, Lambda).
+
+Nice to Have
+------------
+- Experience with Redis caching.
+- Exposure to microservices architecture.
+- Knowledge of GraphQL.
+- Contributions to open-source projects.
+
+What We Offer
+-------------
+- Competitive salary (USD 2,000 – 4,000 / month).
+- Remote-friendly, flexible hours.
+- Annual learning budget (USD 1,000).
+- 15 days paid annual leave + public holidays.
